@@ -6,9 +6,7 @@ from typing import Optional
 import time
 from io import BytesIO
 import logging
-
-# Import the processor class
-from qwen_payslip_processor import QwenPayslipProcessor
+import subprocess
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +30,10 @@ processor = None
 async def startup_event():
     global processor
     logger.info("Initializing Qwen Payslip Processor...")
+    
+    # Import the processor class - model will be downloaded if needed
+    from qwen_payslip_processor import QwenPayslipProcessor
+    
     # Initialize the processor with default settings
     processor = QwenPayslipProcessor()
     logger.info("Model loaded and ready to serve requests")
