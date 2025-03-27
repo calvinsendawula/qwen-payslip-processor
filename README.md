@@ -531,13 +531,13 @@ This option requires internet access only when pulling the Docker image.
 1. **Pull the Docker image** (on a machine with internet access):
 
 ```bash
-docker pull calvinsendawula/qwen-payslip-processor:latest
+docker pull calvin189/qwen-payslip-processor:latest
 ```
 
 2. **Save the Docker image to a file**:
 
 ```bash
-docker save calvinsendawula/qwen-payslip-processor:latest > qwen-payslip-processor.tar
+docker save calvin189/qwen-payslip-processor:latest > qwen-payslip-processor.tar
 ```
 
 3. **Transfer the image file** to your isolated environment.
@@ -551,7 +551,7 @@ docker load < qwen-payslip-processor.tar
 5. **Run the Docker container** with an exposed port:
 
 ```bash
-docker run -d -p 27842:27842 --name qwen-model calvinsendawula/qwen-payslip-processor:latest
+docker run -d -p 27842:27842 --name qwen-model calvin189/qwen-payslip-processor:latest
 ```
 
 6. **Configure your client application** to use the Docker container:
@@ -672,7 +672,7 @@ curl http://localhost:27842/status
 To run with GPU support:
 
 ```bash
-docker run -d -p 27842:27842 --gpus all --name qwen-model calvinsendawula/qwen-payslip-processor:latest
+docker run -d -p 27842:27842 --gpus all --name qwen-model calvin189/qwen-payslip-processor:latest
 ```
 
 ## Notes and Performance Considerations

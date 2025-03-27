@@ -2,9 +2,9 @@ from setuptools import setup, find_packages
 
 setup(
     name="qwen-payslip-processor",
-    version="0.1.0",
+    version="0.1.1",
     author="Calvin Sendawula",
-    author_email="calvinsendawula188@gmail.com",  # Replace with your email
+    author_email="calvinsendawula188@gmail.com",
     description="German payslip processor using Qwen2.5-VL-7B model",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
@@ -27,6 +27,6 @@ setup(
         "Programming Language :: Python :: 3.11",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
-        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence :: OCR",
     ],
 )

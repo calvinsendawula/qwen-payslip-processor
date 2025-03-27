@@ -42,7 +42,7 @@ async def get_status():
     return {
         "status": "ok",
         "model": "Qwen2.5-VL-7B-Instruct",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "ready": processor is not None
     }
 

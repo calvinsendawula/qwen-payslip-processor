@@ -1,7 +1,7 @@
 # PowerShell script to build and publish the Qwen Payslip Processor Docker container
 
 # Configuration
-$IMAGE_NAME = "calvinsendawula/qwen-payslip-processor"
+$IMAGE_NAME = "calvin189/qwen-payslip-processor"
 $IMAGE_TAG = "latest"
 
 # Print header
