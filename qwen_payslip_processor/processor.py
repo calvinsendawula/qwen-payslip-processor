@@ -32,18 +32,30 @@ class QwenPayslipProcessor:
     def __init__(self, 
                  config=None,
                  custom_prompts=None,
-                 window_mode="vertical",  # "whole", "vertical", "horizontal", "quadrant", "custom"
-                 window_regions=None,     # For custom window mode
-                 force_cpu=False):
+                 window_mode="vertical",  # "whole", "vertical", "horizontal", "quadrant"
+                 selected_windows=None,   # List of windows to process, e.g. ["top", "bottom_right"]
+                 force_cpu=False,
+                 model_endpoint=None):    # API endpoint for Docker-based processing
         """Initialize the QwenPayslipProcessor with configuration
         
         Args:
             config (dict): Custom configuration (will be merged with defaults)
             custom_prompts (dict): Custom prompts for different window positions
-            window_mode (str): How to split images - "whole", "vertical", "horizontal", "quadrant", "custom"
-            window_regions (list): List of regions for custom window mode
+            window_mode (str): How to split images - "whole", "vertical", "horizontal", "quadrant"
+            selected_windows (list or str): Window positions to process (default: process all windows)
+                                     Can be a list ["top", "bottom"] or a single string "top"
+                                     Valid options depend on window_mode:
+                                     - "vertical": ["top", "bottom"]
+                                     - "horizontal": ["left", "right"]
+                                     - "quadrant": ["top_left", "top_right", "bottom_left", "bottom_right"]
+                                     - "whole": this parameter is ignored
             force_cpu (bool): Whether to force CPU usage even if GPU is available
+            model_endpoint (str): URL of a remote API endpoint for Docker-based processing
+                                  e.g., "http://localhost:27842"
         """
+        # Store the model endpoint if provided
+        self.model_endpoint = model_endpoint
+        
         # Load configuration
         self.config = self._merge_config(config if config else {})
         
@@ -52,25 +64,44 @@ class QwenPayslipProcessor:
         
         # Set window mode and regions
         self.window_mode = window_mode
-        self.window_regions = window_regions
         
-        # Set device based on user preference
-        if force_cpu:
-            self.device = torch.device("cpu")
+        # Handle selected_windows as either list or string
+        if selected_windows is not None:
+            if isinstance(selected_windows, str):
+                self.selected_windows = [selected_windows]
+            else:
+                self.selected_windows = selected_windows
         else:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.selected_windows = None
         
-        logger.info(f"Using device: {self.device}")
-        
-        # Configure PyTorch for better memory management
-        if torch.cuda.is_available():
-            # Enable memory optimizations
-            torch.cuda.empty_cache()
-            # Set PyTorch to release memory more aggressively
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-        
-        # Load model and processor
-        self._load_model()
+        # Only load the model locally if no model_endpoint is provided
+        if not model_endpoint:
+            # Set device based on user preference
+            if force_cpu:
+                self.device = torch.device("cpu")
+            else:
+                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+            logger.info(f"Using device: {self.device}")
+            
+            # Configure PyTorch for better memory management
+            if torch.cuda.is_available():
+                # Enable memory optimizations
+                torch.cuda.empty_cache()
+                # Set PyTorch to release memory more aggressively
+                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            
+            # Load model and processor
+            self._load_model()
+        else:
+            logger.info(f"Using remote model endpoint: {model_endpoint}")
+            # Check if we have the requests library
+            try:
+                import requests
+            except ImportError:
+                logger.error("The 'requests' library is required for API-based processing. "
+                            "Please install it using 'pip install requests'.")
+                raise
     
     def _merge_config(self, user_config):
         """Merge user configuration with defaults"""
@@ -83,7 +114,11 @@ class QwenPayslipProcessor:
             if key in merged_config and isinstance(merged_config[key], dict) and isinstance(value, dict):
                 # Recursively merge dictionaries
                 for k, v in value.items():
-                    merged_config[key][k] = v
+                    # Special handling for resolution_steps - can be list or single value
+                    if k == "resolution_steps" and not isinstance(v, list):
+                        merged_config[key][k] = [v]  # Convert single value to list
+                    else:
+                        merged_config[key][k] = v
             else:
                 # Override with user value
                 merged_config[key] = value
@@ -97,22 +132,29 @@ class QwenPayslipProcessor:
                 "dpi": 600
             },
             "image": {
-                "initial_resolution": 1500,
                 "resolution_steps": [1500, 1200, 1000, 800, 600],
                 "enhance_contrast": True,
-                "use_advanced_preprocessing": True,
                 "sharpen_factor": 2.5,
                 "contrast_factor": 1.8,
-                "brightness_factor": 1.1
+                "brightness_factor": 1.1,
+                "ocr_language": "deu",     # German language for potential OCR integration
+                "ocr_threshold": 90        # Confidence threshold for OCR (%)
             },
             "window": {
-                "overlap": 0.1
+                "overlap": 0.1,
+                "min_size": 100           # Minimum size in pixels for a window
             },
             "text_generation": {
                 "max_new_tokens": 768,
                 "use_beam_search": False,
                 "num_beams": 1,
+                "temperature": 0.1,       # Temperature for generation
+                "top_p": 0.95,            # Top-p sampling parameter
                 "auto_process_results": True
+            },
+            "extraction": {
+                "confidence_threshold": 0.7,  # Minimum confidence for extracted values
+                "fuzzy_matching": True        # Use fuzzy matching for field names
             }
         }
     
@@ -177,28 +219,67 @@ class QwenPayslipProcessor:
             logger.error(f"Error loading model: {str(e)}")
             raise
     
-    def process_pdf(self, pdf_bytes):
+    def process_pdf(self, pdf_bytes, pages=None):
         """
         Process a PDF using the Qwen model
         
         Args:
             pdf_bytes (bytes): PDF file content as bytes
+            pages (list or int, optional): Page numbers to process (1-indexed).
+                                       Can be a list [1, 3, 5] or a single page number 2.
+                                       If None, processes all pages.
             
         Returns:
             dict: Extracted information
         """
+        # If model_endpoint is set, use the API
+        if self.model_endpoint:
+            return self._process_pdf_via_api(pdf_bytes, pages)
+        
+        # Otherwise, use the local model
         start_time = time.time()
         logger.info("Starting PDF processing")
         
         # Convert PDF to images using PyMuPDF
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            total_pages = len(doc)
+            
+            # Determine which pages to process
+            if pages is None:
+                # Process all pages
+                pages_to_process = list(range(total_pages))
+            else:
+                # Handle pages parameter as either list or single int
+                if isinstance(pages, int):
+                    page_list = [pages]
+                else:
+                    page_list = pages
+                
+                # Validate page indices (convert from 1-indexed to 0-indexed)
+                pages_to_process = []
+                for page_num in page_list:
+                    # Convert 1-indexed page number to 0-indexed
+                    page_idx = page_num - 1
+                    if 0 <= page_idx < total_pages:
+                        pages_to_process.append(page_idx)
+                    else:
+                        logger.warning(f"Skipping invalid page number {page_num} (PDF has {total_pages} pages)")
+                
+                if not pages_to_process:
+                    logger.error("No valid pages to process")
+                    return {"error": "No valid pages to process. Check page numbers."}
+            
+            logger.info(f"Processing {len(pages_to_process)} pages out of {total_pages} total")
+            
+            # Extract images for selected pages
             images = []
-            for page_num in range(len(doc)):
-                page = doc.load_page(page_num)
+            for page_idx in pages_to_process:
+                page = doc.load_page(page_idx)
                 pix = page.get_pixmap(dpi=self.config["pdf"]["dpi"])
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                images.append(img)
+                images.append((img, page_idx))
+                
             logger.info(f"Converted PDF to {len(images)} images")
         except Exception as e:
             logger.error(f"Error converting PDF: {e}")
@@ -206,16 +287,32 @@ class QwenPayslipProcessor:
         
         # Process images
         results = []
-        for page_num, image in enumerate(images):
-            logger.info(f"Processing page {page_num+1}/{len(images)}")
+        for image, page_idx in images:
+            # Use 1-indexed page numbers in logs and results
+            page_num = page_idx + 1
+            logger.info(f"Processing page {page_num}/{total_pages}")
             
             # Split image based on window mode
             windows = split_image_for_window_mode(
                 image, 
                 window_mode=self.window_mode,
-                window_regions=self.window_regions,
                 overlap=self.config["window"]["overlap"]
             )
+            
+            # Filter windows based on selected_windows
+            if self.selected_windows:
+                filtered_windows = []
+                for window_img, window_position in windows:
+                    if window_position in self.selected_windows:
+                        filtered_windows.append((window_img, window_position))
+                windows = filtered_windows
+                if not windows:
+                    logger.warning(f"No windows selected for processing. Using all windows.")
+                    windows = split_image_for_window_mode(
+                        image, 
+                        window_mode=self.window_mode,
+                        overlap=self.config["window"]["overlap"]
+                    )
             
             window_results = []
             # Process each window
@@ -225,6 +322,11 @@ class QwenPayslipProcessor:
             
             # Combine window results
             combined_result = self._combine_window_results(window_results)
+            
+            # Add page information to result (use 1-indexed page number)
+            combined_result["page_index"] = page_idx
+            combined_result["page_number"] = page_num
+            
             results.append(combined_result)
         
         # Calculate processing time
@@ -234,7 +336,9 @@ class QwenPayslipProcessor:
         # Add processing time to results
         final_result = {
             "results": results,
-            "processing_time": processing_time
+            "processing_time": processing_time,
+            "total_pages": total_pages,
+            "processed_pages": len(pages_to_process)
         }
         
         return final_result
@@ -249,6 +353,11 @@ class QwenPayslipProcessor:
         Returns:
             dict: Extracted information
         """
+        # If model_endpoint is set, use the API
+        if self.model_endpoint:
+            return self._process_image_via_api(image_bytes)
+        
+        # Otherwise, use the local model
         start_time = time.time()
         logger.info("Starting image processing")
         
@@ -264,9 +373,23 @@ class QwenPayslipProcessor:
         windows = split_image_for_window_mode(
             image, 
             window_mode=self.window_mode,
-            window_regions=self.window_regions,
             overlap=self.config["window"]["overlap"]
         )
+        
+        # Filter windows based on selected_windows
+        if self.selected_windows:
+            filtered_windows = []
+            for window_img, window_position in windows:
+                if window_position in self.selected_windows:
+                    filtered_windows.append((window_img, window_position))
+            windows = filtered_windows
+            if not windows:
+                logger.warning(f"No windows selected for processing. Using all windows.")
+                windows = split_image_for_window_mode(
+                    image, 
+                    window_mode=self.window_mode,
+                    overlap=self.config["window"]["overlap"]
+                )
         
         window_results = []
         # Process each window
@@ -442,7 +565,7 @@ class QwenPayslipProcessor:
             "found_in_bottom_right": {
                 "employee_name": "unknown",
                 "gross_amount": "0",
-                "net_amount": "Nettogehalt oder '0'"
+                "net_amount": "0"
             }
             }"""
         else:  # whole or any other position
@@ -513,9 +636,11 @@ class QwenPayslipProcessor:
                     output_ids = self.model.generate(
                         **inputs,
                         max_new_tokens=self.config["text_generation"]["max_new_tokens"],
-                        do_sample=False,
+                        do_sample=self.config["text_generation"]["temperature"] > 0.1,
+                        temperature=self.config["text_generation"]["temperature"],
+                        top_p=self.config["text_generation"]["top_p"],
                         use_cache=True,
-                        num_beams=self.config["text_generation"]["num_beams"]
+                        num_beams=self.config["text_generation"]["num_beams"] if self.config["text_generation"]["use_beam_search"] else 1
                     )
                 
                 # Process the output
@@ -569,11 +694,21 @@ class QwenPayslipProcessor:
             "net_amount": "0"
         }
         
+        # Get confidence threshold
+        confidence_threshold = self.config["extraction"].get("confidence_threshold", 0.7)
+        fuzzy_matching = self.config["extraction"].get("fuzzy_matching", True)
+        
         for position, result in window_results:
             # Extract values from result based on position
             key = f"found_in_{position}"
             if key in result:
                 data = result[key]
+                
+                # Check for confidence values (if present)
+                confidence = data.get("confidence", 1.0)
+                if confidence < confidence_threshold:
+                    logger.debug(f"Skipping low confidence result ({confidence}) from {position}")
+                    continue
                 
                 # Update employee name if found
                 if "employee_name" in data and data["employee_name"] != "unknown" and combined["employee_name"] == "unknown":
@@ -581,10 +716,138 @@ class QwenPayslipProcessor:
                 
                 # Update gross amount if found
                 if "gross_amount" in data and data["gross_amount"] != "0" and combined["gross_amount"] == "0":
+                    # Optional: Clean the gross amount format if fuzzy matching is enabled
+                    if fuzzy_matching and not isinstance(data["gross_amount"], str):
+                        data["gross_amount"] = str(data["gross_amount"])
                     combined["gross_amount"] = data["gross_amount"]
                 
                 # Update net amount if found
                 if "net_amount" in data and data["net_amount"] != "0" and combined["net_amount"] == "0":
+                    # Optional: Clean the net amount format if fuzzy matching is enabled
+                    if fuzzy_matching and not isinstance(data["net_amount"], str):
+                        data["net_amount"] = str(data["net_amount"])
                     combined["net_amount"] = data["net_amount"]
         
         return combined
+
+    def _process_pdf_via_api(self, pdf_bytes, pages=None):
+        """Process a PDF by sending it to the remote API endpoint
+        
+        Args:
+            pdf_bytes (bytes): PDF file content as bytes
+            pages (list or int, optional): Page numbers to process
+            
+        Returns:
+            dict: Extracted information from the API
+        """
+        import requests
+        
+        start_time = time.time()
+        logger.info(f"Sending PDF to API endpoint: {self.model_endpoint}/process/pdf")
+        
+        # Prepare the multipart/form-data request
+        files = {
+            'file': ('document.pdf', pdf_bytes, 'application/pdf')
+        }
+        
+        # Prepare optional parameters
+        data = {}
+        
+        # Convert pages parameter
+        if pages is not None:
+            if isinstance(pages, list):
+                data['pages'] = ','.join(str(p) for p in pages)
+            else:
+                data['pages'] = str(pages)
+        
+        # Add window mode if specified
+        if self.window_mode:
+            data['window_mode'] = self.window_mode
+        
+        # Add selected windows if specified
+        if self.selected_windows:
+            if isinstance(self.selected_windows, list):
+                data['selected_windows'] = ','.join(self.selected_windows)
+            else:
+                data['selected_windows'] = self.selected_windows
+        
+        # Send the request
+        try:
+            response = requests.post(
+                f"{self.model_endpoint}/process/pdf",
+                files=files,
+                data=data
+            )
+            
+            # Check for errors
+            response.raise_for_status()
+            
+            # Parse the JSON response
+            result = response.json()
+            
+            logger.info(f"PDF processing via API completed in {time.time() - start_time:.2f} seconds")
+            return result
+        
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {str(e)}")
+            return {
+                "error": f"API request failed: {str(e)}",
+                "processing_time": time.time() - start_time
+            }
+    
+    def _process_image_via_api(self, image_bytes):
+        """Process an image by sending it to the remote API endpoint
+        
+        Args:
+            image_bytes (bytes): Image file content as bytes
+            
+        Returns:
+            dict: Extracted information from the API
+        """
+        import requests
+        
+        start_time = time.time()
+        logger.info(f"Sending image to API endpoint: {self.model_endpoint}/process/image")
+        
+        # Prepare the multipart/form-data request
+        files = {
+            'file': ('image.jpg', image_bytes, 'image/jpeg')
+        }
+        
+        # Prepare optional parameters
+        data = {}
+        
+        # Add window mode if specified
+        if self.window_mode:
+            data['window_mode'] = self.window_mode
+        
+        # Add selected windows if specified
+        if self.selected_windows:
+            if isinstance(self.selected_windows, list):
+                data['selected_windows'] = ','.join(self.selected_windows)
+            else:
+                data['selected_windows'] = self.selected_windows
+        
+        # Send the request
+        try:
+            response = requests.post(
+                f"{self.model_endpoint}/process/image",
+                files=files,
+                data=data
+            )
+            
+            # Check for errors
+            response.raise_for_status()
+            
+            # Parse the JSON response
+            result = response.json()
+            
+            logger.info(f"Image processing via API completed in {time.time() - start_time:.2f} seconds")
+            return result
+        
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {str(e)}")
+            return {
+                "error": f"API request failed: {str(e)}",
+                "processing_time": time.time() - start_time
+            }

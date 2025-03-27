@@ -73,10 +73,9 @@ def split_image_for_window_mode(image, window_mode="vertical", window_regions=No
     
     Args:
         image (PIL.Image): Input image
-        window_mode (str): How to split the image - "vertical", "horizontal", "quadrant", or "custom"
-        window_regions (list): List of regions to extract when mode is "custom".
-                              Each region is a dict with "name" and "box" (left, top, right, bottom).
-        overlap (float): Overlap between windows as a fraction
+        window_mode (str): How to split the image - "vertical", "horizontal", "quadrant", or "whole"
+        window_regions (list): Deprecated, kept for backward compatibility
+        overlap (float): Overlap between windows as a fraction (0.0-0.5)
         
     Returns:
         list: List of tuples containing (window_image, window_position)
@@ -135,14 +134,6 @@ def split_image_for_window_mode(image, window_mode="vertical", window_regions=No
         windows.append((top_right, "top_right"))
         windows.append((bottom_left, "bottom_left"))
         windows.append((bottom_right, "bottom_right"))
-    
-    elif window_mode == "custom" and window_regions:
-        # Custom windows based on provided regions
-        for region in window_regions:
-            name = region["name"]
-            box = region["box"]  # (left, top, right, bottom)
-            window = image.crop(box)
-            windows.append((window, name))
     
     else:
         # Default to whole image if the mode is invalid

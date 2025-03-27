@@ -20,6 +20,7 @@ setup(
         "numpy>=1.24.0,<2.0.0",
         "pyyaml>=6.0,<7.0.0",
         "matplotlib>=3.5.0,<4.0.0",
+        "requests>=2.32.0,<3.0.0",  # For API communication
     ],
     classifiers=[
         "Programming Language :: Python :: 3",

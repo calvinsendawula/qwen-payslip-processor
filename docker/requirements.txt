@@ -1,0 +1,15 @@
+# FastAPI and Uvicorn for serving the API
+fastapi==0.115.8
+uvicorn==0.34.0
+python-multipart==0.0.20
+
+# Core dependencies for the qwen-payslip-processor
+torch==2.5.1+cu121
+transformers==4.50.0
+pillow==11.1.0
+numpy==2.2.4
+PyMuPDF==1.22.0
+PyYAML==6.0.2
+
+# Install the qwen-payslip-processor package itself
+qwen-payslip-processor 
