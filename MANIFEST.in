@@ -1,3 +1,6 @@
 include README.md
 include LICENSE
-recursive-include qwen_payslip_processor/model_files *
+# Create empty model_files directory but don't include model content
+recursive-include qwen_payslip_processor/model_files MODEL_READY
+prune qwen_payslip_processor/model_files/model
+prune qwen_payslip_processor/model_files/processor
