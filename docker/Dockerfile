@@ -8,12 +8,14 @@ RUN apt-get update && apt-get install -y \
     libffi-dev \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements
 COPY requirements.txt .
 
-# Install dependencies
+# Install dependencies (first installing PyTorch with CUDA support)
+RUN pip install --no-cache-dir torch==2.5.1 --extra-index-url https://download.pytorch.org/whl/cu121
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the server code
