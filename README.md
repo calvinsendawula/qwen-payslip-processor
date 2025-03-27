@@ -97,7 +97,7 @@ print(results)
 |----------|-----------|-------------|---------|-------------|
 | **Main Parameters** | | | | |
 | | `window_mode` | Division mode for processing | `"vertical"` | `"whole"`, `"vertical"`, `"horizontal"`, `"quadrant"` |
-| | `selected_windows` | Which windows to process | `None` (all) | • `"whole"` mode: parameter ignored<br>• `"vertical"` mode: `"top"`, `"bottom"`, or `["top", "bottom"]`<br>• `"horizontal"` mode: `"left"`, `"right"`, or `["left", "right"]`<br>• `"quadrant"` mode: any combination of `"top_left"`, `"top_right"`, `"bottom_left"`, `"bottom_right"` |
+| | `selected_windows` | Which windows to process | `None` (all) | * `"whole"` mode: parameter ignored<br>* `"vertical"` mode: `"top"`, `"bottom"`, or `["top", "bottom"]`<br>* `"horizontal"` mode: `"left"`, `"right"`, or `["left", "right"]`<br>* `"quadrant"` mode: any combination of `"top_left"`, `"top_right"`, `"bottom_left"`, `"bottom_right"` |
 | | `force_cpu` | Force CPU even if GPU available | `False` | `True`, `False` |
 | | `custom_prompts` | Custom instructions for windows | `{}` | Dict with keys matching window names (e.g., `{"top": "prompt text", "bottom": "prompt text"}`) |
 | **PDF** | | | | |
