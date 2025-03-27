@@ -12,7 +12,7 @@ Write-Host ""
 # Build the container
 Write-Host "Building Docker container... This will take several minutes." -ForegroundColor Yellow
 Write-Host "Note: The model will be downloaded on first container run, not during build." -ForegroundColor Yellow
-$buildResult = docker build -t "$IMAGE_NAME`:$IMAGE_TAG" .
+docker build -t "$IMAGE_NAME`:$IMAGE_TAG" .
 
 # Check if build was successful
 if ($LASTEXITCODE -ne 0) {
