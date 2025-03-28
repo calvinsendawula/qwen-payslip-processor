@@ -7,6 +7,7 @@ import time
 from io import BytesIO
 import logging
 import subprocess
+from qwen_payslip_processor import QwenPayslipProcessor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
