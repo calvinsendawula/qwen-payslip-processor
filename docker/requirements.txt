@@ -3,13 +3,26 @@ fastapi==0.115.8
 uvicorn==0.34.0
 python-multipart==0.0.20
 
-# Core dependencies for the qwen-payslip-processor
-torch==2.5.1
-transformers==4.50.0
+# Core dependencies 
+transformers==4.50.2
+tokenizers==0.21.1
+accelerate==1.5.2
+safetensors==0.5.3
+PyMuPDF==1.25.4
 pillow==11.1.0
-numpy>=1.24.0,<2.0.0
-PyMuPDF==1.22.0
+numpy==1.26.4
 PyYAML==6.0.2
+fsspec==2025.3.0
+huggingface-hub==0.29.3
+tqdm==4.67.1
+regex==2024.11.6
+requests==2.32.3
 
-# Install the qwen-payslip-processor package itself
-qwen-payslip-processor 
+# PyTorch - this will be replaced by the CUDA version during build
+torch==2.5.1
+
+# Optional dependencies for visualization
+matplotlib==3.10.1
+
+# The qwen-payslip-processor package
+qwen-payslip-processor==0.1.2
