@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 
 # Install dependencies (first installing PyTorch with CUDA support)
-RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 torchaudio==0.20.1 --extra-index-url https://download.pytorch.org/whl/cu121
+RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --extra-index-url https://download.pytorch.org/whl/cu121
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the server code
