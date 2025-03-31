@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="qwen-payslip-processor",
-    version="0.2.1",
+    version="0.1.3",
     author="Calvin Sendawula",
     author_email="calvinsendawula188@gmail.com",
     description="German payslip processor using Qwen2.5-VL-7B model",

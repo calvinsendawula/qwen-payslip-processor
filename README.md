@@ -6,6 +6,8 @@ A Python package for processing German payslips using the Qwen2.5-VL-7B vision-l
 
 - Extracts key information from German payslips in PDF or image format
 - Automatically downloads and caches the Qwen model if not present
+- Processes multiple pages with page-specific configurations
+- Supports running without memory isolation for faster processing
 - Highly customizable processing options:
   - Page selection for multi-page PDFs
   - Page-specific configurations for multi-page documents
@@ -63,7 +65,7 @@ processor = QwenPayslipProcessor(
     window_mode="vertical",
     selected_windows=["top"],
     force_cpu=False,
-    memory_isolation="auto",
+    memory_isolation="none",  # No memory isolation for faster processing
     custom_prompts={
         "top": "Find employee name in this section..."
     },
@@ -156,7 +158,7 @@ processor = QwenPayslipProcessor(
     # Force CPU processing even if GPU is available
     force_cpu=False,
     
-    # Control memory isolation behavior (new in v0.2.0)
+    # Control memory isolation behavior (new in v0.1.3)
     # Options:
     # - "none": No special memory isolation (fastest but may have context bleeding)
     # - "medium": Uses prompt engineering to prevent context bleeding (balanced)
@@ -279,9 +281,11 @@ processor = QwenPayslipProcessor(
 )
 ```
 
-## Memory Isolation (New in v0.2.0)
+## Memory Isolation (Updated in v0.1.3)
 
 The memory isolation feature addresses an important limitation of large language models: they tend to remember the context from previous interactions, which can lead to "context bleeding" between different parts of a document being processed. This can result in incorrect information extraction as the model may mix up content from different parts of the document.
+
+In version 0.1.3, you now have the option to completely disable memory isolation for faster processing when context bleeding is not a concern.
 
 ### Available Memory Isolation Modes
 
@@ -290,6 +294,7 @@ The memory isolation feature addresses an important limitation of large language
    - Fastest processing speed
    - May experience context bleeding between windows
    - Best for single-window processing or when processing speed is critical
+   - Newly emphasized in v0.1.3 for maximum speed
 
 2. **Medium (`"medium"`)**
    - Uses prompt engineering techniques to reset context
@@ -340,9 +345,9 @@ processor = QwenPayslipProcessor(
 
 ### When to Use Each Mode
 
-- **Use "strict" when:** Processing multi-page documents where accuracy is critical and processing time is not a concern.
+- **Use "none" when:** Processing simple documents or when maximum speed is required and context bleeding is not a concern (recommended in v0.1.3 for faster processing).
 - **Use "medium" when:** Processing multi-page documents with a good balance between speed and accuracy.
-- **Use "none" when:** Processing single-page documents or when maximum speed is required.
+- **Use "strict" when:** Processing complex multi-page documents where accuracy is critical and processing time is not a concern.
 - **Use "auto" when:** You're unsure which mode to use and want the processor to make the best choice based on your hardware.
 
 ## Window Division Modes
@@ -596,47 +601,112 @@ processor = QwenPayslipProcessor(
 )
 ```
 
-## Output Format
+## Result Format
 
-Results are returned in this format:
+The package returns comprehensive results with detailed information about the processing:
 
 ```python
 {
     "results": [
-        # One item per processed page
         {
+            # Page 1 results
             "employee_name": "Max Mustermann",
             "gross_amount": "3.500,00",
             "net_amount": "2.100,00",
-            "page_index": 0,
-            "page_number": 1
+            "page_number": 1,
+            "page_index": 0
         },
-        # If multiple pages were processed
         {
-            "employee_name": "unknown",
-            "gross_amount": "4.200,00", 
-            "net_amount": "2.500,00",
-            "page_index": 2,
-            "page_number": 3
+            # Page 2 results
+            "employee_name": "unknown",  # Not found on page 2
+            "gross_amount": "0",  # Not found on page 2
+            "net_amount": "0",  # Not found on page 2
+            "page_number": 2,
+            "page_index": 1
         }
     ],
-    "processing_time": 12.34,  # Total processing time in seconds
-    "total_pages": 5,          # Total pages in the document
-    "processed_pages": 2,       # Number of pages that were processed
-    "isolation_mode": {  # New in v0.2.0
-        "requested": "strict",  # The isolation mode that was requested
-        "actual": "mixed",  # What was actually used (mixed = some fallbacks occurred)
+    "processing_time": 25.78,  # Total processing time in seconds
+    "total_pages": 2,  # Total pages in the document
+    "processed_pages": 2,  # Number of pages processed
+    "isolation_mode": {  # Updated in v0.1.3
+        "requested": "none",  # The isolation mode that was requested
+        "actual": "none",  # What was actually used
         "stats": {
-            "requested": "strict",
+            "requested": "none",
             "windows_processed": 4,
-            "strict_succeeded": 2,
-            "medium_used": 2,
-            "fallbacks_occurred": 2,
+            "strict_succeeded": 0,
+            "medium_used": 0,
+            "fallbacks_occurred": 0,
             "failures": 0
         }
     }
 }
 ```
+
+### Isolation Statistics
+
+The `isolation_mode` section provides valuable information:
+
+- `requested`: The isolation mode that was requested when creating the processor
+- `actual`: Which isolation mode was actually used
+  - Same as `requested` if no fallbacks occurred
+  - `"mixed"` if some windows used different isolation modes due to fallbacks
+- `stats`: Detailed statistics about isolation
+  - `windows_processed`: Total number of windows processed
+  - `strict_succeeded`: Number of windows successfully processed with strict isolation
+  - `medium_used`: Number of windows processed with medium isolation
+  - `fallbacks_occurred`: Number of times strict isolation failed and fell back to medium
+  - `failures`: Number of windows that couldn't be processed with any isolation method
+
+## Multi-Page Processing (Enhanced in v0.1.3)
+
+Version 0.1.3 includes enhanced multi-page processing capabilities, allowing you to specify different processing configurations for different pages in a document:
+
+```python
+from qwen_payslip_processor import QwenPayslipProcessor
+
+# Create processor with page-specific configurations
+processor = QwenPayslipProcessor(
+    # Use no memory isolation for faster processing
+    memory_isolation="none",
+    config={
+        # Global settings (apply to all pages by default)
+        "global": {
+            "mode": "whole",  # Default mode for all pages
+            "prompt": "Extract all information from this payslip"
+        },
+        # Page-specific settings (override globals for specific pages)
+        "pages": {
+            "1": {  # Settings for page 1
+                "mode": "quadrant",
+                "prompt": "Extract header information from this payslip"
+            },
+            "2-3": {  # Settings for pages 2-3
+                "mode": "vertical",
+                "selected_windows": ["top", "bottom"],
+                "prompt": "Extract tabular data from this payslip"
+            },
+            "4,6-8": {  # Settings for pages 4, 6, 7, and 8
+                "mode": "auto",  # Auto-detect best mode
+                "prompt": "Extract any additional information from this page"
+            }
+        }
+    }
+)
+
+# Process all pages with their specific configurations
+with open("path/to/multi_page_document.pdf", "rb") as f:
+    pdf_data = f.read()
+    
+results = processor.process_pdf(pdf_data)
+```
+
+### Page Range Specification
+
+You can specify page ranges using these formats:
+- Single page: `"1"` 
+- Page range: `"2-5"` (processes pages 2, 3, 4, and 5)
+- Multiple pages and ranges: `"1,3,5-7"` (processes pages 1, 3, 5, 6, and 7)
 
 ## Isolated Environment Usage
 
@@ -887,11 +957,11 @@ The auto-detection algorithm selects:
 
 ## Memory Isolation Details
 
-The `memory_isolation` parameter controls how the package prevents context bleeding between different windows of the document. Starting with v0.2.0, this is a critical feature for accurate multi-page and multi-window processing:
+The `memory_isolation` parameter controls how the package prevents context bleeding between different windows of the document. Starting with v0.1.3, this is a critical feature for accurate multi-page and multi-window processing:
 
 ### Isolation Modes
 
-- **none**: No special isolation. Fastest, but may cause the model to remember information from previous windows, potentially leading to incorrect extractions.
+- **none**: No special isolation. Fastest, but may cause the model to remember information from previous windows, potentially leading to incorrect extractions. Recommended in v0.1.3 for faster processing.
 
 - **medium**: Uses prompt engineering to reset context between windows. Good balance between speed and reliability. The package adds special instructions to each prompt telling the model to forget previous context.
 
@@ -952,15 +1022,15 @@ The package returns comprehensive results with detailed information about the pr
     "processing_time": 25.78,  # Total processing time in seconds
     "total_pages": 2,  # Total pages in the document
     "processed_pages": 2,  # Number of pages processed
-    "isolation_mode": {  # New in v0.2.0
-        "requested": "strict",  # The isolation mode that was requested
-        "actual": "mixed",  # What was actually used (mixed = some fallbacks occurred)
+    "isolation_mode": {  # Updated in v0.1.3
+        "requested": "none",  # The isolation mode that was requested
+        "actual": "none",  # What was actually used
         "stats": {
-            "requested": "strict",
+            "requested": "none",
             "windows_processed": 4,
-            "strict_succeeded": 2,
-            "medium_used": 2,
-            "fallbacks_occurred": 2,
+            "strict_succeeded": 0,
+            "medium_used": 0,
+            "fallbacks_occurred": 0,
             "failures": 0
         }
     }
