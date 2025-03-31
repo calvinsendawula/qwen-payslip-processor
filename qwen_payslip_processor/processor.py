@@ -14,16 +14,27 @@ import json
 from pathlib import Path
 from PIL import Image
 from io import BytesIO
+import base64
+from typing import Dict, List, Union, Optional, Any
 
 from .utils import (
     optimize_image_for_vl_model,
     split_image_for_window_mode,
     cleanup_memory,
-    extract_json_from_text
+    extract_json_from_text,
+    get_page_config,
+    detect_best_processing_mode,
+    parse_page_range,
+    convert_image_to_bytes,
+    isolated_process_window
 )
+from .config_defaults import DEFAULT_CONFIG
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 class QwenPayslipProcessor:
@@ -32,16 +43,17 @@ class QwenPayslipProcessor:
     def __init__(self, 
                  config=None,
                  custom_prompts=None,
-                 window_mode="vertical",  # "whole", "vertical", "horizontal", "quadrant"
+                 window_mode="vertical",  # "whole", "vertical", "horizontal", "quadrant", "auto"
                  selected_windows=None,   # List of windows to process, e.g. ["top", "bottom_right"]
                  force_cpu=False,
-                 model_endpoint=None):    # API endpoint for Docker-based processing
+                 model_endpoint=None,     # API endpoint for Docker-based processing
+                 memory_isolation="auto"): # "none", "medium", "strict", or "auto"
         """Initialize the QwenPayslipProcessor with configuration
         
         Args:
             config (dict): Custom configuration (will be merged with defaults)
             custom_prompts (dict): Custom prompts for different window positions
-            window_mode (str): How to split images - "whole", "vertical", "horizontal", "quadrant"
+            window_mode (str): How to split images - "whole", "vertical", "horizontal", "quadrant", "auto"
             selected_windows (list or str): Window positions to process (default: process all windows)
                                      Can be a list ["top", "bottom"] or a single string "top"
                                      Valid options depend on window_mode:
@@ -52,6 +64,11 @@ class QwenPayslipProcessor:
             force_cpu (bool): Whether to force CPU usage even if GPU is available
             model_endpoint (str): URL of a remote API endpoint for Docker-based processing
                                   e.g., "http://localhost:27842"
+            memory_isolation (str): Controls how memory is isolated between processing tasks
+                                   - "none": No special isolation (fastest but potential context bleeding)
+                                   - "medium": Uses prompt engineering to reset context (good balance)
+                                   - "strict": Complete process isolation for each window (slowest but most reliable)
+                                   - "auto": Automatically choose based on hardware (default)
         """
         # Store the model endpoint if provided
         self.model_endpoint = model_endpoint
@@ -59,11 +76,20 @@ class QwenPayslipProcessor:
         # Load configuration
         self.config = self._merge_config(config if config else {})
         
-        # Set custom prompts if provided
-        self.custom_prompts = custom_prompts if custom_prompts else {}
+        # Set custom prompts if provided directly
+        if custom_prompts:
+            self.custom_prompts = custom_prompts
+        else:
+            # Check if custom prompts are provided in the config
+            self.custom_prompts = {}
         
-        # Set window mode and regions
-        self.window_mode = window_mode
+        # Set global window mode from parameters or config
+        if window_mode != "vertical" or "global" not in self.config:
+            # Parameter overrides or no global config present
+            self.window_mode = window_mode
+        else:
+            # Use global mode from config if parameter uses default
+            self.window_mode = self.config["global"].get("mode", "whole")
         
         # Handle selected_windows as either list or string
         if selected_windows is not None:
@@ -74,16 +100,41 @@ class QwenPayslipProcessor:
         else:
             self.selected_windows = None
         
+        # Set memory isolation mode
+        if memory_isolation == "auto":
+            # Choose isolation based on hardware
+            if torch.cuda.is_available():
+                # If GPU available, use medium isolation (GPU reloading is inefficient)
+                self.memory_isolation = "medium"
+            else:
+                # For CPU, strict isolation might be more efficient
+                self.memory_isolation = "strict"
+        else:
+            self.memory_isolation = memory_isolation
+        
+        # Store whether to force CPU usage
+        self.force_cpu = force_cpu
+        
+        # Set device
+        if force_cpu:
+            self.device = torch.device("cpu")
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        logger.info(f"Using device: {self.device}, memory isolation: {self.memory_isolation}")
+        
+        # Track what isolation modes were actually used
+        self.isolation_stats = {
+            "requested": self.memory_isolation,
+            "windows_processed": 0,
+            "strict_succeeded": 0,
+            "medium_used": 0,
+            "fallbacks_occurred": 0,
+            "failures": 0
+        }
+        
         # Only load the model locally if no model_endpoint is provided
         if not model_endpoint:
-            # Set device based on user preference
-            if force_cpu:
-                self.device = torch.device("cpu")
-            else:
-                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            
-            logger.info(f"Using device: {self.device}")
-            
             # Configure PyTorch for better memory management
             if torch.cuda.is_available():
                 # Enable memory optimizations
@@ -91,8 +142,17 @@ class QwenPayslipProcessor:
                 # Set PyTorch to release memory more aggressively
                 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
             
-            # Load model and processor
-            self._load_model()
+            # Define model paths for later use
+            package_dir = Path(__file__).parent.absolute()
+            self.model_dir = os.path.join(package_dir, "model_files")
+            
+            # Set model IDs for all modes
+            self.model_id = "Qwen/Qwen2.5-VL-7B"
+            self.processor_id = "Qwen/Qwen2.5-VL-7B"
+            
+            # Only load model here if not using strict isolation
+            if self.memory_isolation != "strict":
+                self._load_model()
         else:
             logger.info(f"Using remote model endpoint: {model_endpoint}")
             # Check if we have the requests library
@@ -119,104 +179,45 @@ class QwenPayslipProcessor:
                         merged_config[key][k] = [v]  # Convert single value to list
                     else:
                         merged_config[key][k] = v
+            elif key == "global" and isinstance(value, dict):
+                # Ensure global config exists
+                if "global" not in merged_config:
+                    merged_config["global"] = {}
+                # Update global settings
+                merged_config["global"].update(value)
+            elif key == "pages" and isinstance(value, dict):
+                # Handle page-specific configurations
+                merged_config["pages"] = value
             else:
-                # Override with user value
+                # Override with user value for other keys
                 merged_config[key] = value
         
         return merged_config
     
     def _get_default_config(self):
         """Return default configuration"""
-        return {
-            "pdf": {
-                "dpi": 600
-            },
-            "image": {
-                "resolution_steps": [1500, 1200, 1000, 800, 600],
-                "enhance_contrast": True,
-                "sharpen_factor": 2.5,
-                "contrast_factor": 1.8,
-                "brightness_factor": 1.1,
-                "ocr_language": "deu",     # German language for potential OCR integration
-                "ocr_threshold": 90        # Confidence threshold for OCR (%)
-            },
-            "window": {
-                "overlap": 0.1,
-                "min_size": 100           # Minimum size in pixels for a window
-            },
-            "text_generation": {
-                "max_new_tokens": 768,
-                "use_beam_search": False,
-                "num_beams": 1,
-                "temperature": 0.1,       # Temperature for generation
-                "top_p": 0.95,            # Top-p sampling parameter
-                "auto_process_results": True
-            },
-            "extraction": {
-                "confidence_threshold": 0.7,  # Minimum confidence for extracted values
-                "fuzzy_matching": True        # Use fuzzy matching for field names
-            }
-        }
+        return DEFAULT_CONFIG.copy()
     
     def _load_model(self):
-        """Load the Qwen2.5-VL-7B model and processor from the package or download if needed"""
+        """Load model and processor"""
         try:
-            logger.info("Loading Qwen2.5-VL-7B-Instruct model...")
+            logger.info("Loading Qwen model...")
             
-            # Define paths
-            package_dir = Path(__file__).parent.absolute()
-            model_dir = os.path.join(package_dir, "model_files")
-            model_path = os.path.join(model_dir, "model")
-            processor_path = os.path.join(model_dir, "processor")
-            
-            # Create model directory if it doesn't exist
-            os.makedirs(model_dir, exist_ok=True)
-            
-            # Check if model files exist
-            model_exists = os.path.exists(model_path) and os.path.isdir(model_path) and os.listdir(model_path)
-            processor_exists = os.path.exists(processor_path) and os.path.isdir(processor_path) and os.listdir(processor_path)
-            
-            if not model_exists or not processor_exists:
-                logger.info("Model files not found. Downloading them now (this will take some time)...")
-                
-                # Download processor
-                processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
-                processor.save_pretrained(processor_path)
-                logger.info("Processor downloaded and saved successfully!")
-                
-                # Download model
-                model = AutoModelForImageTextToText.from_pretrained(
-                    "Qwen/Qwen2.5-VL-7B-Instruct",
-                    torch_dtype=torch.float16
-                )
-                model.save_pretrained(model_path)
-                logger.info("Model downloaded and saved successfully!")
-                
-                # Create marker file
-                with open(os.path.join(model_dir, "MODEL_READY"), "w") as f:
-                    f.write("Model downloaded and ready")
-            else:
-                logger.info("Model files found in local cache.")
-            
-            # Load processor
-            logger.info("Loading processor...")
-            self.processor = AutoProcessor.from_pretrained(
-                processor_path,
-                local_files_only=True  # Force use of local files
-            )
-            
-            # Load model
-            logger.info("Loading model...")
+            # Load processor and model with appropriate settings
+            self.processor = AutoProcessor.from_pretrained(self.processor_id)
             self.model = AutoModelForImageTextToText.from_pretrained(
-                model_path,
-                torch_dtype=torch.float16,  # Use half precision for memory efficiency
-                device_map="auto",  # Automatically place model on available devices
-                local_files_only=True  # Force use of local files
+                self.model_id,
+                torch_dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
+                device_map="auto" if self.device.type == "cuda" else None
             )
             
-            logger.info("Model loaded successfully!")
+            # Move to CPU if needed
+            if self.device.type != "cuda":
+                self.model = self.model.to(self.device)
+                
+            logger.info("Model loaded successfully")
         except Exception as e:
-            logger.error(f"Error loading model: {str(e)}")
+            logger.error(f"Error loading model: {e}")
             raise
     
     def process_pdf(self, pdf_bytes, pages=None):
@@ -239,6 +240,9 @@ class QwenPayslipProcessor:
         # Otherwise, use the local model
         start_time = time.time()
         logger.info("Starting PDF processing")
+        
+        # Import page config and auto-detection utilities
+        from .utils import get_page_config, detect_best_processing_mode
         
         # Convert PDF to images using PyMuPDF
         try:
@@ -292,33 +296,69 @@ class QwenPayslipProcessor:
             page_num = page_idx + 1
             logger.info(f"Processing page {page_num}/{total_pages}")
             
+            # Get page-specific configuration
+            page_config = get_page_config(self.config, page_num)
+            
+            # Determine window mode for this page
+            page_window_mode = page_config.get("mode", self.window_mode)
+            logger.info(f"Using '{page_window_mode}' window mode for page {page_num}")
+            
+            # Handle auto mode (intelligent detection)
+            if page_window_mode == "auto":
+                # Use the auto-detection function
+                page_window_mode = detect_best_processing_mode(image)
+                logger.info(f"Auto mode: selected '{page_window_mode}' for page {page_num}")
+            
             # Split image based on window mode
             windows = split_image_for_window_mode(
                 image, 
-                window_mode=self.window_mode,
+                window_mode=page_window_mode,
                 overlap=self.config["window"]["overlap"]
             )
             
+            # Get page-specific selected windows
+            page_selected_windows = None
+            if "selected_windows" in page_config:
+                if isinstance(page_config["selected_windows"], str):
+                    page_selected_windows = [page_config["selected_windows"]]
+                else:
+                    page_selected_windows = page_config["selected_windows"]
+            else:
+                page_selected_windows = self.selected_windows
+            
             # Filter windows based on selected_windows
-            if self.selected_windows:
+            if page_selected_windows:
                 filtered_windows = []
                 for window_img, window_position in windows:
-                    if window_position in self.selected_windows:
+                    if window_position in page_selected_windows:
                         filtered_windows.append((window_img, window_position))
                 windows = filtered_windows
                 if not windows:
-                    logger.warning(f"No windows selected for processing. Using all windows.")
+                    logger.warning(f"No windows selected for processing on page {page_num}. Using all windows.")
                     windows = split_image_for_window_mode(
                         image, 
-                        window_mode=self.window_mode,
+                        window_mode=page_window_mode,
                         overlap=self.config["window"]["overlap"]
                     )
             
             window_results = []
             # Process each window
             for window_img, window_position in windows:
-                result = self._process_window(window_img, window_position)
+                # Get page-specific custom prompt if available
+                page_custom_prompt = page_config.get("prompt")
+                
+                # Process the window using page-specific configuration
+                if self.memory_isolation == "strict":
+                    # Use strict isolation with process-based approach
+                    result = self._process_window_with_isolation(window_img, window_position, page_custom_prompt)
+                else:
+                    # Use normal or medium isolation within same process
+                    result = self._process_window(window_img, window_position, page_custom_prompt)
+                
                 window_results.append((window_position, result))
+                
+                # Ensure memory is cleaned up between windows
+                cleanup_memory()
             
             # Combine window results
             combined_result = self._combine_window_results(window_results)
@@ -338,7 +378,12 @@ class QwenPayslipProcessor:
             "results": results,
             "processing_time": processing_time,
             "total_pages": total_pages,
-            "processed_pages": len(pages_to_process)
+            "processed_pages": len(pages_to_process),
+            "isolation_mode": {
+                "requested": self.memory_isolation,
+                "actual": "mixed" if self.isolation_stats["fallbacks_occurred"] > 0 else self.memory_isolation,
+                "stats": self.isolation_stats
+            }
         }
         
         return final_result
@@ -361,10 +406,25 @@ class QwenPayslipProcessor:
         start_time = time.time()
         logger.info("Starting image processing")
         
+        # Import auto-detection utility
+        from .utils import detect_best_processing_mode
+        
+        # Get global configuration
+        global_config = self.config.get("global", {})
+        
+        # Determine window mode from global config
+        image_window_mode = global_config.get("mode", self.window_mode)
+        
         # Convert bytes to PIL Image
         try:
             image = Image.open(BytesIO(image_bytes))
             logger.info(f"Loaded image: {image.width}x{image.height}")
+            
+            # Handle auto mode (intelligent detection)
+            if image_window_mode == "auto":
+                # Use the auto-detection function
+                image_window_mode = detect_best_processing_mode(image)
+                logger.info(f"Auto mode: selected '{image_window_mode}' for image")
         except Exception as e:
             logger.error(f"Error loading image: {e}")
             return {"error": f"Image loading failed: {str(e)}"}
@@ -372,30 +432,53 @@ class QwenPayslipProcessor:
         # Split image based on window mode
         windows = split_image_for_window_mode(
             image, 
-            window_mode=self.window_mode,
+            window_mode=image_window_mode,
             overlap=self.config["window"]["overlap"]
         )
         
+        # Get selected windows from global config or instance
+        global_selected_windows = None
+        if "selected_windows" in global_config:
+            if isinstance(global_config["selected_windows"], str):
+                global_selected_windows = [global_config["selected_windows"]]
+            else:
+                global_selected_windows = global_config["selected_windows"]
+        else:
+            global_selected_windows = self.selected_windows
+        
         # Filter windows based on selected_windows
-        if self.selected_windows:
+        if global_selected_windows:
             filtered_windows = []
             for window_img, window_position in windows:
-                if window_position in self.selected_windows:
+                if window_position in global_selected_windows:
                     filtered_windows.append((window_img, window_position))
             windows = filtered_windows
             if not windows:
                 logger.warning(f"No windows selected for processing. Using all windows.")
                 windows = split_image_for_window_mode(
                     image, 
-                    window_mode=self.window_mode,
+                    window_mode=image_window_mode,
                     overlap=self.config["window"]["overlap"]
                 )
         
         window_results = []
         # Process each window
         for window_img, window_position in windows:
-            result = self._process_window(window_img, window_position)
+            # Get global custom prompt if available
+            global_custom_prompt = global_config.get("prompt")
+            
+            # Process the window using global configuration
+            if self.memory_isolation == "strict":
+                # Use strict isolation with process-based approach
+                result = self._process_window_with_isolation(window_img, window_position, global_custom_prompt)
+            else:
+                # Use normal or medium isolation within same process
+                result = self._process_window(window_img, window_position, global_custom_prompt)
+            
             window_results.append((window_position, result))
+            
+            # Ensure memory is cleaned up between windows
+            cleanup_memory()
         
         # Combine window results
         combined_result = self._combine_window_results(window_results)
@@ -407,7 +490,12 @@ class QwenPayslipProcessor:
         # Add processing time to results
         final_result = {
             "results": [combined_result],  # Keep format consistent with PDF processing
-            "processing_time": processing_time
+            "processing_time": processing_time,
+            "isolation_mode": {
+                "requested": self.memory_isolation,
+                "actual": "mixed" if self.isolation_stats["fallbacks_occurred"] > 0 else self.memory_isolation,
+                "stats": self.isolation_stats
+            }
         }
         
         return final_result
@@ -593,12 +681,41 @@ class QwenPayslipProcessor:
             }
             }"""
     
-    def _process_window(self, window, window_position):
+    def _process_window(self, window, window_position, page_custom_prompt=None):
         """Process a window with the model, trying different resolutions"""
         # Clean up memory before processing
         cleanup_memory()
         
-        prompt_text = self._get_prompt_for_position(window_position)
+        # Track window processing
+        self.isolation_stats["windows_processed"] += 1
+        
+        # When using strict isolation, delegate to isolated processing
+        if self.memory_isolation == "strict":
+            # Strict isolation requires one complete model load per window
+            # This will be handled by calling this method from process_pdf
+            # This branch should not be reached directly in strict mode
+            logger.warning("Direct _process_window call in strict isolation mode - this should not happen!")
+            return self._get_empty_result(window_position)
+        
+        # Track medium isolation usage
+        if self.memory_isolation == "medium":
+            self.isolation_stats["medium_used"] += 1
+        
+        # Get prompt text
+        if self.memory_isolation == "medium":
+            # Add strong context reset instructions to prompt
+            reset_prefix = "WICHTIG: Dies ist eine vollständig neue und separate Aufgabe. " \
+                          "Vergiss ALLES, was du vorher gesehen oder bearbeitet hast. " \
+                          "Ignoriere jeden vorherigen Kontext oder Bilder.\n\n"
+            
+            if page_custom_prompt:
+                prompt_text = reset_prefix + page_custom_prompt
+            else:
+                default_prompt = self._get_prompt_for_position(window_position)
+                prompt_text = reset_prefix + default_prompt
+        else:
+            # Normal mode - no special isolation
+            prompt_text = page_custom_prompt or self._get_prompt_for_position(window_position)
         
         # Try each resolution in sequence until one works
         for resolution in self.config["image"]["resolution_steps"]:
@@ -669,15 +786,157 @@ class QwenPayslipProcessor:
         return self._get_empty_result(window_position)
     
     def _get_empty_result(self, window_position):
-        """Return an empty result structure based on window position"""
-        # Format: found_in_<position>: {employee_name, gross_amount, net_amount}
-        return {
-            f"found_in_{window_position}": {
-                "employee_name": "unknown",
-                "gross_amount": "0",
-                "net_amount": "0"
-            }
-        }
+        """Return an empty result for a window position"""
+        if window_position == "employee":
+            return {"name": "", "id": "", "title": "", "department": ""}
+        elif window_position == "gross":
+            return {"amount": "", "currency": "", "period": ""}
+        elif window_position == "net":
+            return {"amount": "", "currency": "", "period": ""}
+        elif window_position == "supervisor":
+            return {"name": "", "id": "", "title": "", "department": ""}
+        else:
+            return {}
+            
+    def _process_window_with_isolation(self, window, window_position, page_custom_prompt=None):
+        """Process a window with strict memory isolation using a separate process"""
+        logger.info(f"Processing {window_position} window with strict memory isolation...")
+        
+        # Convert window to bytes for passing to subprocess
+        window_bytes = convert_image_to_bytes(window)
+        
+        # Get prompt text
+        prompt_text = page_custom_prompt or self._get_prompt_for_position(window_position)
+        
+        # Track window processing
+        self.isolation_stats["windows_processed"] += 1
+        
+        # Check for local model files and adjust model_id accordingly
+        # This helps the worker process find the right files
+        local_model_path = None
+        if hasattr(self, 'model_dir'):
+            local_model_path = os.path.join(self.model_dir, "model")
+            if os.path.exists(os.path.join(self.model_dir, "MODEL_READY")):
+                # If we have local files, strip the repo prefix from model_id
+                # so the worker knows to look for local files
+                model_id = self.model_id.split('/')[-1] if '/' in self.model_id else self.model_id
+                processor_id = self.processor_id.split('/')[-1] if '/' in self.processor_id else self.processor_id
+                logger.info(f"Using local model files in isolated process with model_id: {model_id}")
+            else:
+                # No local files, use the full HuggingFace path
+                model_id = self.model_id
+                processor_id = self.processor_id
+                logger.info(f"Using HuggingFace model in isolated process: {model_id}")
+        else:
+            # No model directory, use the full HuggingFace path
+            model_id = self.model_id
+            processor_id = self.processor_id
+            logger.info(f"Using HuggingFace model in isolated process: {model_id}")
+        
+        # First, try using strict isolation with process-based approach
+        try:
+            result = isolated_process_window(
+                window_bytes=window_bytes,
+                prompt_text=prompt_text,
+                window_position=window_position,
+                config=self.config,
+                force_cpu=self.force_cpu,
+                model_id=model_id,
+                processor_id=processor_id
+            )
+            
+            # Check if result is valid
+            if result and not self._is_empty_result(result, window_position):
+                logger.info(f"Successfully processed {window_position} window with strict isolation")
+                # Track strict isolation success
+                self.isolation_stats["strict_succeeded"] += 1
+                return result
+            else:
+                # If we got an empty result, fall back to medium isolation
+                logger.warning(f"Strict isolation returned empty result for {window_position}, falling back to medium isolation")
+                # Temporarily switch to medium isolation for this window
+                original_mode = self.memory_isolation
+                self.memory_isolation = "medium"
+                
+                # Ensure model is loaded for medium isolation
+                if not hasattr(self, 'model') or not hasattr(self, 'processor'):
+                    logger.info("Loading model for medium isolation fallback")
+                    self._load_model()
+                
+                # Process with medium isolation
+                medium_result = self._process_window(window, window_position, page_custom_prompt)
+                
+                # Restore original mode
+                self.memory_isolation = original_mode
+                
+                # Track fallback to medium isolation
+                self.isolation_stats["fallbacks_occurred"] += 1
+                self.isolation_stats["medium_used"] += 1
+                
+                if medium_result:
+                    logger.info(f"Successfully processed {window_position} with fallback to medium isolation")
+                    return medium_result
+                else:
+                    logger.warning(f"Both isolation methods failed for {window_position}")
+                    # Track failure
+                    self.isolation_stats["failures"] += 1
+                    return self._get_empty_result(window_position)
+                
+        except Exception as e:
+            # If strict isolation fails with an exception, fall back to medium isolation
+            logger.warning(f"Error with strict isolation for {window_position}: {str(e)}, falling back to medium isolation")
+            
+            # Temporarily switch to medium isolation for this window
+            original_mode = self.memory_isolation
+            self.memory_isolation = "medium"
+            
+            # Ensure model is loaded for medium isolation
+            if not hasattr(self, 'model') or not hasattr(self, 'processor'):
+                logger.info("Loading model for medium isolation fallback")
+                self._load_model()
+            
+            # Process with medium isolation
+            try:
+                medium_result = self._process_window(window, window_position, page_custom_prompt)
+                
+                # Restore original mode
+                self.memory_isolation = original_mode
+                
+                # Track fallback to medium isolation
+                self.isolation_stats["fallbacks_occurred"] += 1
+                self.isolation_stats["medium_used"] += 1
+                
+                if medium_result:
+                    logger.info(f"Successfully processed {window_position} with fallback to medium isolation")
+                    return medium_result
+            except Exception as fallback_error:
+                logger.error(f"Fallback to medium isolation also failed: {str(fallback_error)}")
+                # Restore original mode
+                self.memory_isolation = original_mode
+                # Track failure
+                self.isolation_stats["failures"] += 1
+            
+            # If we got here, both methods failed
+            return self._get_empty_result(window_position)
+            
+    def _is_empty_result(self, result, window_position):
+        """Check if a result is effectively empty"""
+        # For structured results like those from employee, gross, net
+        if isinstance(result, dict):
+            # Check if all values are empty
+            return all(not val for val in result.values())
+        
+        # For window-specific results
+        key = f"found_in_{window_position}"
+        if key in result:
+            # Check default values
+            data = result[key]
+            if "employee_name" in data and data["employee_name"] == "unknown":
+                if "gross_amount" in data and data["gross_amount"] == "0":
+                    if "net_amount" in data and data["net_amount"] == "0":
+                        return True
+        
+        return False
     
     def _combine_window_results(self, window_results):
         """Combine results from multiple windows
@@ -731,123 +990,87 @@ class QwenPayslipProcessor:
         return combined
 
     def _process_pdf_via_api(self, pdf_bytes, pages=None):
-        """Process a PDF by sending it to the remote API endpoint
-        
-        Args:
-            pdf_bytes (bytes): PDF file content as bytes
-            pages (list or int, optional): Page numbers to process
-            
-        Returns:
-            dict: Extracted information from the API
-        """
+        """Process a PDF using the remote API endpoint"""
         import requests
+        import base64
         
-        start_time = time.time()
-        logger.info(f"Sending PDF to API endpoint: {self.model_endpoint}/process/pdf")
+        url = f"{self.model_endpoint}/process_pdf"
         
-        # Prepare the multipart/form-data request
-        files = {
-            'file': ('document.pdf', pdf_bytes, 'application/pdf')
+        # Prepare payload
+        payload = {
+            "config": self.config,
+            "window_mode": self.window_mode
         }
         
-        # Prepare optional parameters
-        data = {}
+        # Add custom prompts if set
+        if self.custom_prompts:
+            payload["custom_prompts"] = self.custom_prompts
         
-        # Convert pages parameter
-        if pages is not None:
-            if isinstance(pages, list):
-                data['pages'] = ','.join(str(p) for p in pages)
-            else:
-                data['pages'] = str(pages)
-        
-        # Add window mode if specified
-        if self.window_mode:
-            data['window_mode'] = self.window_mode
-        
-        # Add selected windows if specified
+        # Add selected windows if set
         if self.selected_windows:
-            if isinstance(self.selected_windows, list):
-                data['selected_windows'] = ','.join(self.selected_windows)
-            else:
-                data['selected_windows'] = self.selected_windows
+            payload["selected_windows"] = self.selected_windows
         
-        # Send the request
+        # Add pages parameter if set
+        if pages is not None:
+            payload["pages"] = pages
+        
+        # Encode PDF as base64
+        b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
+        payload["pdf_data"] = b64_pdf
+        
+        # Call API
+        logger.info(f"Calling API endpoint: {url}")
         try:
-            response = requests.post(
-                f"{self.model_endpoint}/process/pdf",
-                files=files,
-                data=data
-            )
+            response = requests.post(url, json=payload, timeout=300)  # 5-minute timeout
             
-            # Check for errors
-            response.raise_for_status()
-            
-            # Parse the JSON response
-            result = response.json()
-            
-            logger.info(f"PDF processing via API completed in {time.time() - start_time:.2f} seconds")
-            return result
-        
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed: {str(e)}")
-            return {
-                "error": f"API request failed: {str(e)}",
-                "processing_time": time.time() - start_time
-            }
+            if response.status_code == 200:
+                return response.json()
+            else:
+                error_msg = f"API error: {response.status_code}, {response.text}"
+                logger.error(error_msg)
+                return {"error": error_msg}
+        except Exception as e:
+            error_msg = f"Error calling API: {str(e)}"
+            logger.error(error_msg)
+            return {"error": error_msg}
     
     def _process_image_via_api(self, image_bytes):
-        """Process an image by sending it to the remote API endpoint
-        
-        Args:
-            image_bytes (bytes): Image file content as bytes
-            
-        Returns:
-            dict: Extracted information from the API
-        """
+        """Process an image using the remote API endpoint"""
         import requests
+        import base64
         
-        start_time = time.time()
-        logger.info(f"Sending image to API endpoint: {self.model_endpoint}/process/image")
+        url = f"{self.model_endpoint}/process_image"
         
-        # Prepare the multipart/form-data request
-        files = {
-            'file': ('image.jpg', image_bytes, 'image/jpeg')
+        # Prepare payload
+        payload = {
+            "config": self.config,
+            "window_mode": self.window_mode
         }
         
-        # Prepare optional parameters
-        data = {}
+        # Add custom prompts if set
+        if self.custom_prompts:
+            payload["custom_prompts"] = self.custom_prompts
         
-        # Add window mode if specified
-        if self.window_mode:
-            data['window_mode'] = self.window_mode
-        
-        # Add selected windows if specified
+        # Add selected windows if set
         if self.selected_windows:
-            if isinstance(self.selected_windows, list):
-                data['selected_windows'] = ','.join(self.selected_windows)
-            else:
-                data['selected_windows'] = self.selected_windows
+            payload["selected_windows"] = self.selected_windows
         
-        # Send the request
+        # Encode image as base64
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+        payload["image_data"] = b64_image
+        
+        # Call API
+        logger.info(f"Calling API endpoint: {url}")
         try:
-            response = requests.post(
-                f"{self.model_endpoint}/process/image",
-                files=files,
-                data=data
-            )
+            response = requests.post(url, json=payload, timeout=300)  # 5-minute timeout
             
-            # Check for errors
-            response.raise_for_status()
-            
-            # Parse the JSON response
-            result = response.json()
-            
-            logger.info(f"Image processing via API completed in {time.time() - start_time:.2f} seconds")
-            return result
-        
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed: {str(e)}")
-            return {
-                "error": f"API request failed: {str(e)}",
-                "processing_time": time.time() - start_time
-            }
+            if response.status_code == 200:
+                return response.json()
+            else:
+                error_msg = f"API error: {response.status_code}, {response.text}"
+                logger.error(error_msg)
+                return {"error": error_msg}
+        except Exception as e:
+            error_msg = f"Error calling API: {str(e)}"
+            logger.error(error_msg)
+            return {"error": error_msg}

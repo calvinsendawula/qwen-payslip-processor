@@ -8,7 +8,9 @@ A Python package for processing German payslips using the Qwen2.5-VL-7B vision-l
 - Automatically downloads and caches the Qwen model if not present
 - Highly customizable processing options:
   - Page selection for multi-page PDFs
+  - Page-specific configurations for multi-page documents
   - Multiple window division modes (whole, vertical split, horizontal split, quadrants)
+  - Auto-detection of optimal processing mode
   - Selective processing of specific windows/regions
   - Adjustable image resolution, enhancement, and preprocessing parameters
   - Customizable prompts for specific document regions
@@ -61,6 +63,7 @@ processor = QwenPayslipProcessor(
     window_mode="vertical",
     selected_windows=["top"],
     force_cpu=False,
+    memory_isolation="auto",
     custom_prompts={
         "top": "Find employee name in this section..."
     },
@@ -96,10 +99,19 @@ print(results)
 | Category | Parameter | Description | Default | Valid Range/Options |
 |----------|-----------|-------------|---------|-------------|
 | **Main Parameters** | | | | |
-| | `window_mode` | Division mode for processing | `"vertical"` | `"whole"`, `"vertical"`, `"horizontal"`, `"quadrant"` |
+| | `window_mode` | Division mode for processing | `"vertical"` | `"whole"`, `"vertical"`, `"horizontal"`, `"quadrant"`, `"auto"` |
 | | `selected_windows` | Which windows to process | `None` (all) | * `"whole"` mode: parameter ignored<br>* `"vertical"` mode: `"top"`, `"bottom"`, or `["top", "bottom"]`<br>* `"horizontal"` mode: `"left"`, `"right"`, or `["left", "right"]`<br>* `"quadrant"` mode: any combination of `"top_left"`, `"top_right"`, `"bottom_left"`, `"bottom_right"` |
 | | `force_cpu` | Force CPU even if GPU available | `False` | `True`, `False` |
+| | `memory_isolation` | Control model memory isolation | `"auto"` | `"none"`, `"medium"`, `"strict"`, `"auto"` |
 | | `custom_prompts` | Custom instructions for windows | `{}` | Dict with keys matching window names (e.g., `{"top": "prompt text", "bottom": "prompt text"}`) |
+| **Global Config** | | | | |
+| | `config["global"]["mode"]` | Default mode for all pages | `"whole"` | `"whole"`, `"vertical"`, `"horizontal"`, `"quadrant"`, `"auto"` |
+| | `config["global"]["prompt"]` | Default prompt for all pages | `None` | Any string |
+| | `config["global"]["selected_windows"]` | Default windows for all pages | `None` (all) | Same as main `selected_windows` parameter |
+| **Page-Specific Config** | | | | |
+| | `config["pages"]["range"]["mode"]` | Mode for specific pages | - | `"whole"`, `"vertical"`, `"horizontal"`, `"quadrant"`, `"auto"` |
+| | `config["pages"]["range"]["prompt"]` | Prompt for specific pages | - | Any string |
+| | `config["pages"]["range"]["selected_windows"]` | Windows for specific pages | - | Same as main `selected_windows` parameter |
 | **PDF** | | | | |
 | | `config["pdf"]["dpi"]` | PDF rendering DPI | `600` | `150`-`600` |
 | **Image** | | | | |
@@ -130,7 +142,7 @@ from qwen_payslip_processor import QwenPayslipProcessor
 
 # Create processor with all parameters explicitly set
 processor = QwenPayslipProcessor(
-    # Window division mode - exactly one of: "whole", "vertical", "horizontal", "quadrant"
+    # Window division mode - exactly one of: "whole", "vertical", "horizontal", "quadrant", "auto"
     window_mode="vertical",
     
     # Only process specific windows - must match the window_mode you selected
@@ -138,10 +150,19 @@ processor = QwenPayslipProcessor(
     # For "horizontal" mode, can use: ["left", "right"] or just "left" or just "right"
     # For "quadrant" mode, can use any combination of: ["top_left", "top_right", "bottom_left", "bottom_right"]
     # For "whole" mode: this parameter is ignored
+    # For "auto" mode: the appropriate windows will be selected based on the detected mode
     selected_windows=["top"],  
     
     # Force CPU processing even if GPU is available
     force_cpu=False,
+    
+    # Control memory isolation behavior (new in v0.2.0)
+    # Options:
+    # - "none": No special memory isolation (fastest but may have context bleeding)
+    # - "medium": Uses prompt engineering to prevent context bleeding (balanced)
+    # - "strict": Complete process isolation for each window (slowest but most reliable)
+    # - "auto": Automatically select based on hardware (default)
+    memory_isolation="auto",
     
     # Custom prompts that MUST match your window_mode and selected_windows
     # Keys MUST be exactly the same as the window names (e.g., "top", "bottom_right")
@@ -152,6 +173,30 @@ processor = QwenPayslipProcessor(
     
     # Configuration dictionary with all parameters
     config={
+        # NEW: Global settings that apply to all pages by default
+        "global": {
+            "mode": "vertical",  # Default mode for all pages
+            "prompt": "Extract payslip information",  # Default prompt for all pages
+            "selected_windows": ["top", "bottom"]  # Default windows for all pages
+        },
+        
+        # NEW: Page-specific configurations that override global settings
+        "pages": {
+            "1": {  # Settings for page 1 only
+                "mode": "quadrant",
+                "prompt": "Extract header information",
+                "selected_windows": ["top_left"]
+            },
+            "2-3": {  # Settings for pages 2-3
+                "mode": "vertical",
+                "prompt": "Extract tabular data",
+                "selected_windows": ["bottom"]
+            },
+            "4,6-8": {  # Settings for pages 4, 6, 7, and 8
+                "mode": "auto"  # Use auto-detection for these pages
+            }
+        },
+        
         "pdf": {
             "dpi": 600,               # PDF rendering DPI (Range: 150-600)
         },
@@ -233,6 +278,72 @@ processor = QwenPayslipProcessor(
     }
 )
 ```
+
+## Memory Isolation (New in v0.2.0)
+
+The memory isolation feature addresses an important limitation of large language models: they tend to remember the context from previous interactions, which can lead to "context bleeding" between different parts of a document being processed. This can result in incorrect information extraction as the model may mix up content from different parts of the document.
+
+### Available Memory Isolation Modes
+
+1. **None (`"none"`)**
+   - No special memory isolation techniques
+   - Fastest processing speed
+   - May experience context bleeding between windows
+   - Best for single-window processing or when processing speed is critical
+
+2. **Medium (`"medium"`)**
+   - Uses prompt engineering techniques to reset context
+   - Adds special instructions to the prompt telling the model to forget previous context
+   - Good balance between speed and isolation
+   - Works well for most use cases
+   - Default for GPU processing
+
+3. **Strict (`"strict"`)**
+   - Complete process isolation for each window
+   - Loads a fresh model instance for each window in a separate process
+   - Most reliable isolation with zero context bleeding
+   - Significantly slower due to model reloading
+   - Higher memory requirements
+   - Default for CPU processing
+
+4. **Auto (`"auto"`)**
+   - Automatically selects the appropriate mode based on hardware
+   - Uses "medium" for GPU processing
+   - Uses "strict" for CPU processing
+   - Default behavior
+
+### Usage Example
+
+```python
+from qwen_payslip_processor import QwenPayslipProcessor
+
+# For maximum reliability with multi-page documents
+processor = QwenPayslipProcessor(
+    memory_isolation="strict"  # Complete process isolation
+)
+
+# For balanced performance
+processor = QwenPayslipProcessor(
+    memory_isolation="medium"  # Prompt-based isolation
+)
+
+# For maximum speed (when context bleeding is not a concern)
+processor = QwenPayslipProcessor(
+    memory_isolation="none"  # No special isolation
+)
+
+# Let the processor decide based on hardware (default)
+processor = QwenPayslipProcessor(
+    memory_isolation="auto"  # Auto-selection
+)
+```
+
+### When to Use Each Mode
+
+- **Use "strict" when:** Processing multi-page documents where accuracy is critical and processing time is not a concern.
+- **Use "medium" when:** Processing multi-page documents with a good balance between speed and accuracy.
+- **Use "none" when:** Processing single-page documents or when maximum speed is required.
+- **Use "auto" when:** You're unsure which mode to use and want the processor to make the best choice based on your hardware.
 
 ## Window Division Modes
 
@@ -511,7 +622,19 @@ Results are returned in this format:
     ],
     "processing_time": 12.34,  # Total processing time in seconds
     "total_pages": 5,          # Total pages in the document
-    "processed_pages": 2       # Number of pages that were processed
+    "processed_pages": 2,       # Number of pages that were processed
+    "isolation_mode": {  # New in v0.2.0
+        "requested": "strict",  # The isolation mode that was requested
+        "actual": "mixed",  # What was actually used (mixed = some fallbacks occurred)
+        "stats": {
+            "requested": "strict",
+            "windows_processed": 4,
+            "strict_succeeded": 2,
+            "medium_used": 2,
+            "fallbacks_occurred": 2,
+            "failures": 0
+        }
+    }
 }
 ```
 
@@ -686,3 +809,181 @@ docker run -d -p 27842:27842 --gpus all --name qwen-model calvin189/qwen-payslip
 ## License
 
 MIT
+
+## Multi-Page Configuration
+
+For multi-page documents, you can apply different processing modes and settings to different pages:
+
+```python
+from qwen_payslip_processor import QwenPayslipProcessor
+
+# Create processor with page-specific configurations
+processor = QwenPayslipProcessor(
+    config={
+        # Global settings (apply to all pages by default)
+        "global": {
+            "mode": "whole",  # Default mode for all pages
+            "prompt": "Extract all information from this payslip"
+        },
+        # Page-specific settings (override globals for specific pages)
+        "pages": {
+            "1": {  # Settings for page 1
+                "mode": "quadrant",
+                "prompt": "Extract header information from this payslip"
+            },
+            "2-3": {  # Settings for pages 2-3
+                "mode": "vertical",
+                "selected_windows": ["top", "bottom"],
+                "prompt": "Extract tabular data from this payslip"
+            },
+            "4,6-8": {  # Settings for pages 4, 6, 7, and 8
+                "mode": "auto",  # Auto-detect best mode
+                "prompt": "Extract any additional information from this page"
+            }
+        }
+    }
+)
+
+# Process all pages with their specific configurations
+with open("path/to/multi_page_document.pdf", "rb") as f:
+    pdf_data = f.read()
+    
+results = processor.process_pdf(pdf_data)
+```
+
+### Page Range Specification
+
+You can specify page ranges using these formats:
+- Single page: `"1"` 
+- Page range: `"2-5"` (processes pages 2, 3, 4, and 5)
+- Multiple pages and ranges: `"1,3,5-7"` (processes pages 1, 3, 5, 6, and 7)
+
+### Auto-Detection Mode
+
+The new `"auto"` mode intelligently analyzes document dimensions to select the optimal processing approach:
+
+```python
+from qwen_payslip_processor import QwenPayslipProcessor
+
+# Use auto-detection mode for all pages
+processor = QwenPayslipProcessor(
+    config={
+        "global": {
+            "mode": "auto"  # Automatically detect best processing mode
+        }
+    }
+)
+
+# Process a document with auto-detection
+with open("path/to/document.pdf", "rb") as f:
+    results = processor.process_pdf(f.read())
+```
+
+The auto-detection algorithm selects:
+- `"horizontal"` mode for wide documents (aspect ratio > 1.5)
+- `"vertical"` mode for tall documents (aspect ratio < 0.75)
+- `"quadrant"` mode for large documents (> 1500px in both dimensions)
+- `"whole"` mode for standard documents
+
+## Memory Isolation Details
+
+The `memory_isolation` parameter controls how the package prevents context bleeding between different windows of the document. Starting with v0.2.0, this is a critical feature for accurate multi-page and multi-window processing:
+
+### Isolation Modes
+
+- **none**: No special isolation. Fastest, but may cause the model to remember information from previous windows, potentially leading to incorrect extractions.
+
+- **medium**: Uses prompt engineering to reset context between windows. Good balance between speed and reliability. The package adds special instructions to each prompt telling the model to forget previous context.
+
+- **strict**: Complete process isolation. Each window is processed in its own separate process with a fresh model instance. This is the most reliable method but can be slower and more resource-intensive.
+
+- **auto** (default): Automatically selects the isolation mode based on your hardware. Uses `medium` on GPU systems (since model reloading is inefficient on GPU) and `strict` on CPU systems.
+
+### Automatic Fallback
+
+The package includes a built-in fallback mechanism:
+
+1. When `strict` isolation is requested but fails (e.g., on platforms with multiprocessing limitations), the package automatically falls back to `medium` isolation.
+
+2. This fallback is completely transparent - your application code doesn't need to handle any errors or implement special logic.
+
+3. The processing results include information about which isolation mode was actually used, allowing you to track if fallbacks occurred.
+
+### Isolation Mode Usage
+
+```python
+# Request strict isolation (with automatic fallback to medium if necessary)
+processor = QwenPayslipProcessor(memory_isolation="strict")
+
+# Process with confidence that the package will handle isolation properly
+result = processor.process_pdf(pdf_bytes)
+
+# Check what isolation mode was actually used (optional)
+isolation_info = result["isolation_mode"]
+print(f"Requested: {isolation_info['requested']}, Actual: {isolation_info['actual']}")
+print(f"Windows processed: {isolation_info['stats']['windows_processed']}")
+print(f"Fallbacks occurred: {isolation_info['stats']['fallbacks_occurred']}")
+```
+
+## Result Format
+
+The package returns comprehensive results with detailed information about the processing:
+
+```python
+{
+    "results": [
+        {
+            # Page 1 results
+            "employee_name": "Max Mustermann",
+            "gross_amount": "3.500,00",
+            "net_amount": "2.100,00",
+            "page_number": 1,
+            "page_index": 0
+        },
+        {
+            # Page 2 results
+            "employee_name": "unknown",  # Not found on page 2
+            "gross_amount": "0",  # Not found on page 2
+            "net_amount": "0",  # Not found on page 2
+            "page_number": 2,
+            "page_index": 1
+        }
+    ],
+    "processing_time": 25.78,  # Total processing time in seconds
+    "total_pages": 2,  # Total pages in the document
+    "processed_pages": 2,  # Number of pages processed
+    "isolation_mode": {  # New in v0.2.0
+        "requested": "strict",  # The isolation mode that was requested
+        "actual": "mixed",  # What was actually used (mixed = some fallbacks occurred)
+        "stats": {
+            "requested": "strict",
+            "windows_processed": 4,
+            "strict_succeeded": 2,
+            "medium_used": 2,
+            "fallbacks_occurred": 2,
+            "failures": 0
+        }
+    }
+}
+```
+
+### Isolation Statistics
+
+The `isolation_mode` section provides valuable information:
+
+- `requested`: The isolation mode that was requested when creating the processor
+- `actual`: Which isolation mode was actually used
+  - Same as `requested` if no fallbacks occurred
+  - `"mixed"` if some windows used different isolation modes due to fallbacks
+- `stats`: Detailed statistics about isolation
+  - `windows_processed`: Total number of windows processed
+  - `strict_succeeded`: Number of windows successfully processed with strict isolation
+  - `medium_used`: Number of windows processed with medium isolation
+  - `fallbacks_occurred`: Number of times strict isolation failed and fell back to medium
+  - `failures`: Number of windows that couldn't be processed with any isolation method
+
+| **Global Config** | | | | |
+|----------|-----------|-------------|---------|-------------|
+| | `config["global"]["mode"]` | Default mode for all pages | `"whole"` | `"whole"`, `"vertical"`, `"horizontal"`, `"quadrant"`, `"auto"` |
+| | `config["global"]["prompt"]` | Default prompt for all pages | `None` | Any string |
+| | `config["global"]["selected_windows"]` | Default windows for all pages | `None` (all) | Same as main `selected_windows` parameter |
