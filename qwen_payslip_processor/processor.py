@@ -945,8 +945,9 @@ class QwenPayslipProcessor:
             window_results (list): List of tuples containing (window_position, result)
         
         Returns:
-            dict: Combined result with best values from each window
+            dict: Combined result with values from each window preserved
         """
+        # Initialize with backward-compatible structure for payslips
         combined = {
             "employee_name": "unknown",
             "gross_amount": "0",
@@ -957,6 +958,7 @@ class QwenPayslipProcessor:
         confidence_threshold = self.config["extraction"].get("confidence_threshold", 0.7)
         fuzzy_matching = self.config["extraction"].get("fuzzy_matching", True)
         
+        # For each window, preserve the exact JSON structure returned by the model
         for position, result in window_results:
             # Extract values from result based on position
             key = f"found_in_{position}"
@@ -969,20 +971,20 @@ class QwenPayslipProcessor:
                     logger.debug(f"Skipping low confidence result ({confidence}) from {position}")
                     continue
                 
-                # Update employee name if found
+                # Add the entire structure directly to the combined result
+                combined[key] = data
+                
+                # For backward compatibility with existing payslip structure:
+                # Also update standard fields at the top level if they exist in this window
                 if "employee_name" in data and data["employee_name"] != "unknown" and combined["employee_name"] == "unknown":
                     combined["employee_name"] = data["employee_name"]
                 
-                # Update gross amount if found
                 if "gross_amount" in data and data["gross_amount"] != "0" and combined["gross_amount"] == "0":
-                    # Optional: Clean the gross amount format if fuzzy matching is enabled
                     if fuzzy_matching and not isinstance(data["gross_amount"], str):
                         data["gross_amount"] = str(data["gross_amount"])
                     combined["gross_amount"] = data["gross_amount"]
                 
-                # Update net amount if found
                 if "net_amount" in data and data["net_amount"] != "0" and combined["net_amount"] == "0":
-                    # Optional: Clean the net amount format if fuzzy matching is enabled
                     if fuzzy_matching and not isinstance(data["net_amount"], str):
                         data["net_amount"] = str(data["net_amount"])
                     combined["net_amount"] = data["net_amount"]
