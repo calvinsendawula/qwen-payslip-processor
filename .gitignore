@@ -5,6 +5,8 @@ __pycache__/
 
 # Distribution / packaging
 dist/
+old_dist/
+old_dist_2/
 build/
 *.egg-info/
 *.egg
@@ -48,3 +50,6 @@ docs/_build/
 
 # Jupyter Notebook
 .ipynb_checkpoints 
+
+old_dist/
+old_dist_2/
