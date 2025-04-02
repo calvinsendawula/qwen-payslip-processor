@@ -147,8 +147,8 @@ class QwenPayslipProcessor:
             self.model_dir = os.path.join(package_dir, "model_files")
             
             # Set model IDs for all modes
-            self.model_id = "Qwen/Qwen2.5-VL-7B"
-            self.processor_id = "Qwen/Qwen2.5-VL-7B"
+            self.model_id = "Qwen/Qwen2.5-VL-7B-Instruct"
+            self.processor_id = "Qwen/Qwen2.5-VL-7B-Instruct"
             
             # Only load model here if not using strict isolation
             if self.memory_isolation != "strict":

@@ -25,4 +25,4 @@ torch==2.5.1
 matplotlib==3.10.1
 
 # The qwen-payslip-processor package
-qwen-payslip-processor==0.1.2
+qwen-payslip-processor==0.1.4
