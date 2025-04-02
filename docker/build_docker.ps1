@@ -1,68 +1,83 @@
-# PowerShell script to build and publish the Qwen Payslip Processor Docker container
+# PowerShell script to build and push the Docker image for Qwen Payslip Processor
 
 # Configuration
-$IMAGE_NAME="calvin189/qwen-payslip-processor"
-$IMAGE_TAG="latest"
-$VERSION="v0.1.4"
+$VERSION = "0.1.4"
+$IMAGE_NAME = "qwen-payslip-processor"
+$REPOSITORY = "calvin189"  # Docker Hub username/organization
+$TAG = "${REPOSITORY}/${IMAGE_NAME}:latest"
+$VERSION_TAG = "${REPOSITORY}/${IMAGE_NAME}:${VERSION}"
 
-# Print header
-Write-Host "=== Building Qwen Payslip Processor Docker Container ===" -ForegroundColor Cyan
-Write-Host "Image: $IMAGE_NAME`:$IMAGE_TAG"
-Write-Host ""
+Write-Host "Building Docker image for Qwen Payslip Processor with pre-packaged model..."
+Write-Host "Note: This will create a large Docker image (~14GB) since it includes the model files."
+Write-Host "Make sure you have enough disk space."
 
-# Build the container
-Write-Host "Building Docker container... This will take several minutes." -ForegroundColor Yellow
-Write-Host "Note: The model will be downloaded on first container run, not during build."
-
-try {
-    docker build -t "$IMAGE_NAME`:$IMAGE_TAG" .
-    
-    # Also tag with version number
-    docker tag "$IMAGE_NAME`:$IMAGE_TAG" "$IMAGE_NAME`:$VERSION"
-}
-catch {
-    Write-Host ""
-    Write-Host "Docker build FAILED! See error messages above." -ForegroundColor Red
-    Write-Host "Common issues:" -ForegroundColor Red
-    Write-Host "- Make sure Docker is running" -ForegroundColor Red
-    Write-Host "- Check if you have enough disk space (need at least 5GB)" -ForegroundColor Red
-    Write-Host "- There may be dependency conflicts in requirements.txt" -ForegroundColor Red
+# Check if model cache exists at expected location
+$MODEL_CACHE_PATH = "..\..\model_cache"
+if (-not (Test-Path $MODEL_CACHE_PATH)) {
+    Write-Host "Error: Model cache directory not found at $MODEL_CACHE_PATH" -ForegroundColor Red
+    Write-Host "Please download the model files first or adjust the path in this script." -ForegroundColor Red
     exit 1
 }
 
-# Print success message
-Write-Host ""
-Write-Host "Docker container built successfully!" -ForegroundColor Green
+# Check for key model directories
+if (-not (Test-Path "$MODEL_CACHE_PATH\models--Qwen--Qwen2.5-VL-7B-Instruct") -or -not (Test-Path "$MODEL_CACHE_PATH\model")) {
+    Write-Host "Error: Required model files not found in $MODEL_CACHE_PATH" -ForegroundColor Red
+    Write-Host "Please download the complete model before building the Docker image." -ForegroundColor Red
+    exit 1
+}
 
-Write-Host ""
-Write-Host "To run the container with CPU (basic setup):" -ForegroundColor Green
-Write-Host "  docker run -d -p 27842:27842 --name qwen-processor ``" -ForegroundColor Yellow
-Write-Host "    -v qwen-models:/app/models ``" -ForegroundColor Yellow
-Write-Host "    -v qwen-configs:/app/configs ``" -ForegroundColor Yellow
-Write-Host "    $IMAGE_NAME`:$IMAGE_TAG" -ForegroundColor Yellow
+# Copy model files to current directory for build
+Write-Host "Copying model files for Docker build..."
+New-Item -ItemType Directory -Force -Path .\model_cache | Out-Null
+Copy-Item -Path "$MODEL_CACHE_PATH\models--Qwen--Qwen2.5-VL-7B-Instruct" -Destination .\model_cache\ -Recurse -Force
+Copy-Item -Path "$MODEL_CACHE_PATH\model" -Destination .\model_cache\ -Recurse -Force
+Copy-Item -Path "$MODEL_CACHE_PATH\processor" -Destination .\model_cache\ -Recurse -Force
+if (Test-Path "$MODEL_CACHE_PATH\QWEN_MODEL_READY") {
+    Copy-Item -Path "$MODEL_CACHE_PATH\QWEN_MODEL_READY" -Destination .\model_cache\ -Force
+}
 
-Write-Host ""
-Write-Host "To run with GPU support (recommended for performance):" -ForegroundColor Green
-Write-Host "  docker run -d -p 27842:27842 --gpus all --name qwen-processor ``" -ForegroundColor Yellow
-Write-Host "    --memory=12g --memory-swap=24g --shm-size=1g ``" -ForegroundColor Yellow
-Write-Host "    -v qwen-models:/app/models ``" -ForegroundColor Yellow
-Write-Host "    -v qwen-configs:/app/configs ``" -ForegroundColor Yellow
-Write-Host "    $IMAGE_NAME`:$IMAGE_TAG" -ForegroundColor Yellow
+# Build the Docker image
+Write-Host "Building Docker image..."
+docker build -t "$TAG" -t "$VERSION_TAG" .
 
-Write-Host ""
-Write-Host "Memory-optimized setup for systems with limited resources:" -ForegroundColor Green
-Write-Host "  docker run -d -p 27842:27842 --name qwen-processor ``" -ForegroundColor Yellow
-Write-Host "    -v qwen-models:/app/models ``" -ForegroundColor Yellow
-Write-Host "    -v qwen-configs:/app/configs ``" -ForegroundColor Yellow
-Write-Host "    -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 ``" -ForegroundColor Yellow
-Write-Host "    $IMAGE_NAME`:$IMAGE_TAG" -ForegroundColor Yellow
+# Clean up temporary files
+Write-Host "Cleaning up temporary model files..."
+Remove-Item -Path .\model_cache -Recurse -Force
 
-Write-Host ""
-Write-Host "To save the container for air-gapped environments:" -ForegroundColor Green
-Write-Host "  docker save $IMAGE_NAME`:$IMAGE_TAG > qwen-payslip-processor.tar" -ForegroundColor Yellow
+Write-Host "Image built successfully: $TAG and $VERSION_TAG"
+Write-Host "To push to Docker Hub:"
+Write-Host "docker push $TAG"
+Write-Host "docker push $VERSION_TAG"
 
+# Add information about running with different settings
+Write-Host "How to run the container:" -ForegroundColor Green
+Write-Host "1. Basic run (uses CPU by default):" -ForegroundColor Yellow
+Write-Host "   docker run -d -p 27842:27842 --name qwen-processor $TAG"
 Write-Host ""
-Write-Host "To push to Docker Hub (requires login):" -ForegroundColor Green
-Write-Host "  docker login" -ForegroundColor Yellow
-Write-Host "  docker push $IMAGE_NAME`:$IMAGE_TAG" -ForegroundColor Yellow
-Write-Host "  docker push $IMAGE_NAME`:$VERSION" -ForegroundColor Yellow 
+Write-Host "2. Run with GPU support (if available):" -ForegroundColor Yellow
+Write-Host "   docker run -d -p 27842:27842 --gpus all -e FORCE_CPU=false --name qwen-processor $TAG"
+Write-Host ""
+Write-Host "3. Run with customized default settings:" -ForegroundColor Yellow
+Write-Host "   docker run -d -p 27842:27842 --name qwen-processor \\"
+Write-Host "     -e FORCE_CPU=false \\"
+Write-Host "     -v your-configs:/app/configs \\"
+Write-Host "     $TAG"
+Write-Host ""
+Write-Host "NOTE: Even when running with default CPU mode, you can still override this at runtime" -ForegroundColor Cyan
+Write-Host "by passing force_cpu=false in the API requests." -ForegroundColor Cyan
+
+# Optionally push to Docker Hub
+$PUSH_CHOICE = Read-Host "Do you want to push the image to Docker Hub? (y/n)"
+
+if ($PUSH_CHOICE -eq "y" -or $PUSH_CHOICE -eq "Y") {
+    Write-Host "Pushing images to Docker Hub..."
+    docker push "$TAG"
+    docker push "$VERSION_TAG"
+    Write-Host "Images pushed successfully."
+} else {
+    Write-Host "Images not pushed. You can push them later with:"
+    Write-Host "docker push $TAG"
+    Write-Host "docker push $VERSION_TAG"
+}
+
+Write-Host "Done!" 

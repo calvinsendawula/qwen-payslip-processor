@@ -36,12 +36,133 @@ async def startup_event():
     global processor
     logger.info("Initializing Qwen Payslip Processor...")
     
-    # Import the processor class - model will be downloaded if needed
-    from qwen_payslip_processor import QwenPayslipProcessor
-    
-    # Initialize the processor with default settings
-    processor = QwenPayslipProcessor()
-    logger.info("Model loaded and ready to serve requests")
+    try:
+        # Set HuggingFace to offline mode to prevent download attempts
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        
+        # Check if model files exist
+        model_path = os.path.join("/app/models", "models--Qwen--Qwen2.5-VL-7B-Instruct")
+        if not os.path.exists(model_path):
+            logger.error(f"Model files not found at {model_path}. Container may be missing pre-packaged model!")
+            raise FileNotFoundError(f"Model files not found at {model_path}")
+        
+        # Import the processor class - should use cached files
+        from qwen_payslip_processor import QwenPayslipProcessor
+        
+        # Define custom default configuration that matches requirements
+        default_config = {
+            "pdf": {
+                "dpi": 350  # Set default PDF DPI to 350
+            },
+            "image": {
+                "resolution_steps": [900, 600],  # Simplified resolution steps
+                "enhance_contrast": True,
+                "sharpen_factor": 2.0,
+                "contrast_factor": 1.5,
+                "brightness_factor": 1.1,
+                "ocr_language": "eng",
+                "ocr_threshold": 90
+            },
+            "window": {
+                "overlap": 0.1,
+                "min_size": 100
+            },
+            "text_generation": {
+                "max_new_tokens": 768,
+                "use_beam_search": False,
+                "num_beams": 1,
+                "temperature": 0.1,
+                "top_p": 0.95
+            },
+            "extraction": {
+                "confidence_threshold": 0.7,
+                "fuzzy_matching": True
+            },
+            "global": {
+                "mode": "vertical",  # Default to vertical mode
+                "selected_windows": ["top", "bottom"]  # Default to processing both top and bottom
+            }
+        }
+        
+        # Default prompts for vertical mode (top/bottom)
+        default_prompts = {
+            "top": """Du siehst die obere Hälfte einer deutschen Gehaltsabrechnung.
+
+SUCHE NACH DIESEN INFORMATIONEN:
+1. Namen des Angestellten, meist nach "Herrn/Frau" oder unter "Name"
+2. Bruttogehalt ("Gesamt-Brutto") falls in diesem Bereich sichtbar
+3. Nettogehalt ("Auszahlungsbetrag") falls in diesem Bereich sichtbar
+
+WICHTIG:
+- Bei der Suche nach dem Namen, ignoriere Firmen- oder Versicherungsnamen
+- Gib "unknown" für den Namen zurück, wenn du ihn nicht finden kannst
+- Gib "0" zurück, wenn Bruttogehalt oder Nettogehalt in diesem Bereich nicht gefunden werden
+- Achte auf das korrekte Format: #.###,## (mit Punkt als Tausendertrennzeichen)
+
+Gib deine Funde als JSON zurück:
+{
+"found_in_top": {
+    "employee_name": "Name des Angestellten oder 'unknown'",
+    "gross_amount": "Bruttogehalt oder '0'",
+    "net_amount": "Nettogehalt oder '0'"
+}
+}""",
+            "bottom": """Du siehst die untere Hälfte einer deutschen Gehaltsabrechnung.
+
+SUCHE NACH DIESEN INFORMATIONEN:
+1. Namen des Angestellten falls in diesem Bereich sichtbar
+2. Bruttogehalt ("Gesamt-Brutto")
+   - WICHTIG: Es gibt möglicherweise zwei "Gesamt-Brutto" Werte!
+   - Der korrekte Wert steht meist unter dem Label "Gesamt-Brutto" auf der rechten Seite
+   - Ignoriere Werte unter "Verdienstbescheinigung" auf der linken Seite
+   - Der Wert sollte im Bereich von 1.000 € bis 10.000 € liegen
+3. Nettogehalt ("Auszahlungsbetrag")
+   - Meist ganz unten im Dokument
+   - Der Wert steht direkt neben dem Label, oft rechts ausgerichtet
+   - Typischerweise die letzte Zahl im Dokument
+   - Der Wert sollte kleiner als das Bruttogehalt sein
+
+WICHTIG:
+- Gib NUR die Werte zurück, die zu diesen spezifischen Labels gehören
+- Achte auf das korrekte Format: #.###,## (mit Punkt als Tausendertrennzeichen)
+- Gib "unknown" für den Namen zurück, wenn du ihn nicht finden kannst
+- Gib "0" für Beträge zurück, wenn du sie nicht sicher identifizieren kannst
+
+Gib deine Funde als JSON zurück:
+{
+"found_in_bottom": {
+    "employee_name": "Name des Angestellten oder 'unknown'",
+    "gross_amount": "Bruttogehalt oder '0'",
+    "net_amount": "Nettogehalt oder '0'"
+}
+}"""
+        }
+        
+        # Get force_cpu setting from environment but allow it to be overridden
+        # Default to true (prefer CPU) but can be changed via API
+        force_cpu_default = os.environ.get("FORCE_CPU", "true").lower() in ("true", "1", "yes")
+        
+        # Initialize the processor with custom defaults
+        processor = QwenPayslipProcessor(
+            window_mode="vertical",  # Default to vertical mode
+            selected_windows=["top", "bottom"],  # Process both top and bottom
+            force_cpu=force_cpu_default,  # Default from env but can be overridden
+            memory_isolation="none",  # No memory isolation by default
+            custom_prompts=default_prompts,  # Default prompts for vertical mode
+            config=default_config  # Default configuration
+        )
+        
+        logger.info("Model loaded and ready to serve requests")
+        logger.info(f"Default window mode: vertical, processing top and bottom")
+        logger.info(f"Default memory isolation: none")
+        logger.info(f"Default force_cpu setting: {force_cpu_default}")
+        logger.info(f"Default resolution steps: {default_config['image']['resolution_steps']}")
+        logger.info(f"Default PDF DPI: {default_config['pdf']['dpi']}")
+    except Exception as e:
+        logger.error(f"Failed to initialize processor: {str(e)}")
+        logger.exception(e)
+        # We'll continue running but the /status endpoint will show not ready
 
 @app.get("/status")
 async def get_status():
@@ -162,9 +283,22 @@ def build_config_from_params(params: Dict[str, Any]) -> Dict[str, Any]:
                 # Handle single value (convert to list)
                 if isinstance(steps, (int, str)) and not isinstance(steps, list):
                     steps = [int(steps)]
+                elif isinstance(steps, list):
+                    # Ensure all items are integers
+                    steps = [int(step) if isinstance(step, str) else step for step in steps]
+                    # Add additional validation
+                    for i, step in enumerate(steps):
+                        if not isinstance(step, int):
+                            logger.warning(f"Non-integer value found in resolution_steps at position {i}: {step}, converting to int")
+                            steps[i] = int(float(step))
+                
+                logger.info(f"Successfully parsed resolution_steps: {steps}")
                 config["image"]["resolution_steps"] = steps
-            except:
-                logger.warning(f"Invalid resolution_steps format: {params['image_resolution_steps']}")
+            except Exception as e:
+                logger.warning(f"Invalid resolution_steps format: {params['image_resolution_steps']}, error: {str(e)}")
+                # Provide a default value to prevent failures
+                config["image"]["resolution_steps"] = [600, 400]
+                logger.info(f"Using default resolution_steps: {config['image']['resolution_steps']}")
                 
         if 'image_enhance_contrast' in params:
             config["image"]["enhance_contrast"] = parse_config_param(params['image_enhance_contrast'], bool)
@@ -375,35 +509,98 @@ async def process_pdf(
                 if "mode" in config["global"]:
                     logger.info(f"Overriding global mode '{config['global']['mode']}' with UI mode '{window_mode}'")
                     config["global"]["mode"] = window_mode
-                if "selected_windows" in config["global"] and parsed_windows:
-                    logger.info(f"Overriding global selected windows with UI selection")
-                    config["global"]["selected_windows"] = parsed_windows
+        
+        # If selected_windows is provided, it should ALWAYS override global settings
+        # This ensures user-selected windows are always respected
+        selected_windows_param = params.get('selected_windows')
+        if selected_windows_param:
+            parsed_windows = parse_windows(selected_windows_param)
+            if parsed_windows and "global" in config:
+                logger.info(f"Overriding global selected windows with UI selection: {parsed_windows}")
+                config["global"]["selected_windows"] = parsed_windows
+                # Also ensure processing.selected_windows matches to avoid any conflicts
+                if "processing" not in config:
+                    config["processing"] = {}
+                config["processing"]["selected_windows"] = parsed_windows
+                logger.info(f"Also setting processing.selected_windows to: {parsed_windows}")
     
     # If full_config is provided, merge it with existing config
     if full_config:
         try:
+            logger.info(f"Parsing full_config parameter: {full_config[:200]}{'...' if len(full_config) > 200 else ''}")
             json_config = json.loads(full_config)
+            
+            # Ensure specific numeric types are correctly handled
+            if "image" in json_config and "resolution_steps" in json_config["image"]:
+                steps = json_config["image"]["resolution_steps"]
+                if not isinstance(steps, list):
+                    if isinstance(steps, str) and ',' in steps:
+                        # Handle comma-separated string
+                        steps = [int(s.strip()) for s in steps.split(',')]
+                    else:
+                        # Handle single value
+                        steps = [int(steps)]
+                else:
+                    # Ensure all list items are integers
+                    steps = [int(s) if isinstance(s, (str, float)) else s for s in steps]
+                
+                logger.info(f"Processed resolution_steps from full_config: {steps}")
+                json_config["image"]["resolution_steps"] = steps
+            
             # Deep merge
             for key, value in json_config.items():
                 if key in config and isinstance(config[key], dict) and isinstance(value, dict):
                     config[key].update(value)
                 else:
                     config[key] = value
+                    
+            logger.info(f"Successfully merged full_config into config")
         except Exception as e:
-            logger.warning(f"Error parsing full_config: {e}")
+            logger.warning(f"Error parsing full_config: {str(e)}")
+            logger.warning(f"Full config parsing failed, will use individual parameters instead")
     
     # For debugging: log the configuration
     logger.info(f"Configuration: window_mode={window_mode}, selected_windows={parsed_windows}, memory_isolation={memory_isolation_str}")
     logger.info(f"Full config being used: {config}")
     logger.info(f"Custom prompts: {custom_prompts}")
     
+    # Final validation for critical parameters
+    if "image" in config and "resolution_steps" in config["image"]:
+        try:
+            # Ensure resolution_steps is a list of integers
+            steps = config["image"]["resolution_steps"]
+            if not isinstance(steps, list):
+                logger.warning(f"resolution_steps is not a list, converting: {steps}")
+                if isinstance(steps, (int, float)):
+                    steps = [int(steps)]
+                elif isinstance(steps, str):
+                    steps = [int(s.strip()) for s in steps.split(',')]
+                else:
+                    steps = [600, 400]  # Default fallback
+            else:
+                # Convert any non-integer values to integers
+                for i, step in enumerate(steps):
+                    if not isinstance(step, int):
+                        logger.warning(f"Non-integer in resolution_steps[{i}]: {step}, converting")
+                        try:
+                            steps[i] = int(float(step))
+                        except:
+                            steps[i] = 600  # Default fallback for this position
+            
+            # Update the config with validated steps
+            config["image"]["resolution_steps"] = steps
+            logger.info(f"Final validated resolution_steps: {steps}")
+        except Exception as e:
+            logger.warning(f"Error validating resolution_steps: {str(e)}, using defaults")
+            config["image"]["resolution_steps"] = [600, 400]  # Safe default
+    
     # Create a custom processor with all parameters
     try:
         logger.info("Creating custom processor with provided parameters")
         custom_processor = QwenPayslipProcessor(
             window_mode=window_mode if window_mode else processor.window_mode,
-            selected_windows=parsed_windows,
-            force_cpu=force_cpu_bool,
+            selected_windows=parsed_windows if parsed_windows else processor.selected_windows,
+            force_cpu=force_cpu_bool if force_cpu_bool is not None else processor.force_cpu,
             memory_isolation=memory_isolation_str if memory_isolation_str else processor.memory_isolation,
             custom_prompts=custom_prompts if custom_prompts else None,
             config=config if config else None
@@ -537,35 +734,93 @@ async def process_image(
                 if "mode" in config["global"]:
                     logger.info(f"Overriding global mode '{config['global']['mode']}' with UI mode '{window_mode}'")
                     config["global"]["mode"] = window_mode
-                if "selected_windows" in config["global"] and parsed_windows:
-                    logger.info(f"Overriding global selected windows with UI selection")
-                    config["global"]["selected_windows"] = parsed_windows
+        
+        # If selected_windows is provided, it should ALWAYS override global settings
+        # This ensures user-selected windows are always respected
+        selected_windows_param = params.get('selected_windows')
+        if selected_windows_param:
+            parsed_windows = parse_windows(selected_windows_param)
+            if parsed_windows and "global" in config:
+                logger.info(f"Overriding global selected windows with UI selection: {parsed_windows}")
+                config["global"]["selected_windows"] = parsed_windows
     
     # If full_config is provided, merge it with existing config
     if full_config:
         try:
+            logger.info(f"Parsing full_config parameter: {full_config[:200]}{'...' if len(full_config) > 200 else ''}")
             json_config = json.loads(full_config)
+            
+            # Ensure specific numeric types are correctly handled
+            if "image" in json_config and "resolution_steps" in json_config["image"]:
+                steps = json_config["image"]["resolution_steps"]
+                if not isinstance(steps, list):
+                    if isinstance(steps, str) and ',' in steps:
+                        # Handle comma-separated string
+                        steps = [int(s.strip()) for s in steps.split(',')]
+                    else:
+                        # Handle single value
+                        steps = [int(steps)]
+                else:
+                    # Ensure all list items are integers
+                    steps = [int(s) if isinstance(s, (str, float)) else s for s in steps]
+                
+                logger.info(f"Processed resolution_steps from full_config: {steps}")
+                json_config["image"]["resolution_steps"] = steps
+            
             # Deep merge
             for key, value in json_config.items():
                 if key in config and isinstance(config[key], dict) and isinstance(value, dict):
                     config[key].update(value)
                 else:
                     config[key] = value
+                    
+            logger.info(f"Successfully merged full_config into config")
         except Exception as e:
-            logger.warning(f"Error parsing full_config: {e}")
+            logger.warning(f"Error parsing full_config: {str(e)}")
+            logger.warning(f"Full config parsing failed, will use individual parameters instead")
     
     # For debugging: log the configuration
     logger.info(f"Configuration: window_mode={window_mode}, selected_windows={parsed_windows}, memory_isolation={memory_isolation_str}")
     logger.info(f"Full config being used: {config}")
     logger.info(f"Custom prompts: {custom_prompts}")
     
+    # Final validation for critical parameters
+    if "image" in config and "resolution_steps" in config["image"]:
+        try:
+            # Ensure resolution_steps is a list of integers
+            steps = config["image"]["resolution_steps"]
+            if not isinstance(steps, list):
+                logger.warning(f"resolution_steps is not a list, converting: {steps}")
+                if isinstance(steps, (int, float)):
+                    steps = [int(steps)]
+                elif isinstance(steps, str):
+                    steps = [int(s.strip()) for s in steps.split(',')]
+                else:
+                    steps = [600, 400]  # Default fallback
+            else:
+                # Convert any non-integer values to integers
+                for i, step in enumerate(steps):
+                    if not isinstance(step, int):
+                        logger.warning(f"Non-integer in resolution_steps[{i}]: {step}, converting")
+                        try:
+                            steps[i] = int(float(step))
+                        except:
+                            steps[i] = 600  # Default fallback for this position
+            
+            # Update the config with validated steps
+            config["image"]["resolution_steps"] = steps
+            logger.info(f"Final validated resolution_steps: {steps}")
+        except Exception as e:
+            logger.warning(f"Error validating resolution_steps: {str(e)}, using defaults")
+            config["image"]["resolution_steps"] = [600, 400]  # Safe default
+    
     # Create a custom processor with all parameters
     try:
         logger.info("Creating custom processor with provided parameters")
         custom_processor = QwenPayslipProcessor(
             window_mode=window_mode if window_mode else processor.window_mode,
-            selected_windows=parsed_windows,
-            force_cpu=force_cpu_bool,
+            selected_windows=parsed_windows if parsed_windows else processor.selected_windows,
+            force_cpu=force_cpu_bool if force_cpu_bool is not None else processor.force_cpu,
             memory_isolation=memory_isolation_str if memory_isolation_str else processor.memory_isolation,
             custom_prompts=custom_prompts if custom_prompts else None,
             config=config if config else None

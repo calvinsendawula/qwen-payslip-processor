@@ -211,6 +211,62 @@ You can provide page-specific settings using the `page_configs` parameter with a
 
 For complex scenarios, you can send the entire configuration as a single JSON blob using the `full_config` parameter.
 
+## Pre-packaged Model vs. Runtime Download
+
+This Docker container can be built in two ways:
+
+### 1. Pre-packaged Model (Recommended)
+
+The recommended approach is to build the Docker image with the model files already included. This results in a larger image (approximately 14GB) but eliminates the need to download the model at runtime, which is more reliable and allows the container to work in environments with limited internet connectivity.
+
+#### Advantages:
+- Immediate startup - no need to wait for model downloads
+- Works in air-gapped or limited connectivity environments
+- More reliable and predictable performance
+- No download timeouts or network issues
+
+#### Disadvantages:
+- Larger Docker image size (~14GB vs ~2.9GB)
+- Requires more disk space during build and deployment
+
+### 2. Runtime Download (Original Approach)
+
+The original approach downloads the model when the container first starts. This results in a smaller image but requires a stable internet connection and can lead to timeouts or failures in environments with limited connectivity.
+
+#### Advantages:
+- Smaller Docker image size (~2.9GB)
+- Less disk space required during build
+
+#### Disadvantages:
+- Requires downloading ~10GB+ of model files on first run
+- Needs stable, high-bandwidth internet connection
+- Can time out or fail in limited connectivity environments
+- Container not ready until download completes (can take 30+ minutes)
+
+### How to Build with Pre-packaged Model
+
+To build the Docker image with the model pre-packaged:
+
+1. First, ensure you have the model downloaded locally in a `model_cache` directory:
+   ```bash
+   # Directory structure should look like:
+   model_cache/
+   ├── models--Qwen--Qwen2.5-VL-7B-Instruct/
+   ├── model/
+   └── processor/
+   ```
+
+2. Run the build script which will copy these files into the Docker image:
+   ```bash
+   # For Linux/macOS
+   ./build_docker.sh
+   
+   # For Windows
+   .\build_docker.ps1
+   ```
+
+3. The script will build and tag the Docker image with the model included
+
 ## Distributing the Container
 
 To share the container with environments that don't have internet access:
